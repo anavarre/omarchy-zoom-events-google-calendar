@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "anavarre.zoom-events-google-calendar",
+  "name": "Zoom Events Google Calendar",
+  "version": "1.0.0",
+  "author": "Aurelien Navarre",
+  "license": "MIT",
+  "description": "Shows your current or next Zoom meeting from Google Calendar in the bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Zoom Events",
+    "description": "Calendar icon and title of the next Zoom meeting from your Google Calendar.",
+    "category": "Time",
+    "aliases": ["zoom", "meeting", "calendar", "google"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "refreshMinutes": 10, "lookaheadHours": 12, "maxTitleLength": 40, "maxMeetings": 5, "textSize": "medium" },
+    "schema": [
+      { "key": "refreshMinutes", "type": "integer", "label": "Refresh interval (minutes)", "min": 1, "max": 120, "step": 1, "defaultValue": 10, "description": "How often the calendar feed is downloaded." },
+      { "key": "lookaheadHours", "type": "integer", "label": "Look ahead (hours)", "min": 1, "max": 168, "step": 1, "defaultValue": 12, "description": "Only show meetings starting within this many hours." },
+      { "key": "maxTitleLength", "type": "integer", "label": "Max title length", "min": 5, "max": 120, "step": 1, "defaultValue": 40, "description": "Longer titles are truncated." },
+      { "key": "maxMeetings", "type": "integer", "label": "Meetings in the panel", "min": 1, "max": 10, "step": 1, "defaultValue": 5, "description": "How many upcoming meetings the panel lists, across as many days as needed." },
+      { "key": "textSize", "type": "enum", "label": "Text size", "options": ["small", "medium", "large", "xlarge"], "defaultValue": "medium", "description": "How large the panel's text reads: small, medium, large or xlarge (extra large)." }
+    ]
+  }
+}
