@@ -25,11 +25,22 @@ events that have a Zoom link.
    address is stored (mode 0600). Large calendars can take up to a minute: you
    can close the panel, the bar shows `Connecting…`, and a notification reports
    the result. A failure keeps its message and your pasted address, and
-   reopening the panel lands on the form. Or save the address yourself:
+   reopening the panel lands on the form. The panel is the recommended way to
+   enter the address: it is validated before being stored.
+
+   The address grants read access to your calendar, so never put it in the
+   command text, where interactive shell history would keep it. If you must
+   save it from a terminal, use a silent prompt instead. The address is typed
+   at the prompt, not echoed and not recorded in history:
 
    ```sh
-   install -Dm600 /dev/stdin ~/.config/omarchy-zoom-events-google-calendar/ics-url <<< 'https://calendar.google.com/calendar/ical/…/basic.ics'
+   read -rsp 'Secret iCal address: ' ICS_URL; echo
+   install -Dm600 /dev/stdin ~/.config/omarchy-zoom-events-google-calendar/ics-url <<< "$ICS_URL"
+   unset ICS_URL
    ```
+
+   This path skips the panel's validation; open the panel afterwards to check
+   that the feed loads.
 
 3. Install the plugin:
 
