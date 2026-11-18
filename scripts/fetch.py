@@ -23,6 +23,7 @@ Only the standard library and python-dateutil are used.
 
 import argparse
 import contextlib
+import fcntl
 import datetime as dt
 import json
 import os
@@ -482,6 +483,22 @@ def write_private(path, write):
         raise
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Exclusive lock shared by every process that changes the connected
+    calendar or its caches (one widget instance runs per screen). Commits and
+    disconnects serialize on it, so a refresh can never publish after a
+    disconnect has wiped the files."""
+    d = os.path.dirname(CACHE_FILE)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
+
+
 def still_configured(url):
     """True while `url` is still the connected calendar. A refresh that was
     already running when the user disconnected must not write its download back."""
@@ -518,9 +535,10 @@ def check(url, hours, local_tz, save=False):
         return 0
     if save:
         try:
-            write_cache(text)
-            write_events(events)
-            save_config(url)  # last: a half-written state never looks configured
+            with state_lock():
+                write_cache(text)
+                write_events(events)
+                save_config(url)  # last: a half-written state never looks configured
         except OSError as exc:
             print(json.dumps({"ok": False, "message":
                               f"The calendar works, but the address could not be saved ({exc}). "
@@ -553,7 +571,34 @@ def write_events(events):
         print(f"{APP}: could not write events cache: {exc}", file=sys.stderr)
 
 
+def disconnect():
+    """Forget the connected calendar: the address first, then the caches, all
+    under the state lock. Prints {"ok": true} or {"ok": false, "message"}; a
+    file that cannot be removed is reported, never silently kept."""
+    failures = []
+    try:
+        with state_lock():
+            for path in (CONFIG_FILE, CACHE_FILE, EVENTS_FILE):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    failures.append(f"{os.path.basename(path)}: {exc.strerror or exc}")
+    except OSError as exc:
+        failures.append(f"lock: {exc.strerror or exc}")
+    if failures:
+        print(json.dumps({"ok": False, "message":
+                          "Could not remove all saved calendar data (" + "; ".join(failures) + ")."}))
+        return 1
+    print(json.dumps({"ok": True}))
+    return 0
+
+
 def cached_events(now):
+    # Without a current connection the cache is leftover data, never shown.
+    if read_url() is None:
+        return None
     try:
         with open(EVENTS_FILE, encoding="utf-8") as f:
             events = json.load(f)
@@ -573,6 +618,8 @@ def main(argv=None):
                          "address out of the process arguments")
     ap.add_argument("--save", action="store_true",
                     help="with --check: also store the address and prime the caches")
+    ap.add_argument("--disconnect", action="store_true",
+                    help="forget the address and cached calendar, then exit")
     ap.add_argument("--cached", action="store_true",
                     help="answer from the local cache only, never the network")
     ap.add_argument("--tz", help="local IANA zone (default: system)")
@@ -582,6 +629,9 @@ def main(argv=None):
     now = dt.datetime.fromisoformat(args.now) if args.now else dt.datetime.now(UTC)
     if now.tzinfo is None:
         now = now.replace(tzinfo=local_tz)
+
+    if args.disconnect:
+        return disconnect()
 
     if args.check:
         if args.check == "-":
@@ -608,8 +658,9 @@ def main(argv=None):
             return 0
         try:
             text = download(url)
-            if still_configured(url):
-                write_cache(text)
+            with state_lock():
+                if still_configured(url):
+                    write_cache(text)
         except Exception as exc:  # network, HTTP, size: fall back to the cache
             print(f"{APP}: fetch failed: {exc}", file=sys.stderr)
             text = read_cache()
@@ -631,8 +682,10 @@ def main(argv=None):
         print(json.dumps({"events": [], "error": "parse-failed"}))
         return 0
 
-    if not args.ics and not stale and still_configured(url):
-        write_events(events)
+    if not args.ics and not stale:
+        with state_lock():
+            if still_configured(url):
+                write_events(events)
     print(json.dumps({"events": events, "stale": stale, **failure}))
     return 0
 

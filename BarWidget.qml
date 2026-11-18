@@ -149,18 +149,28 @@ BarWidget {
   }
 
   function wipe() {
-    wiper.command = Model.disconnectCommand()
+    wiper.command = Model.disconnectCommand(root.script)
     wiper.running = true
   }
 
   Process {
     id: wiper
     running: false
-    onExited: function() {
+    stdout: StdioCollector { id: wipeOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      var message = ""
+      if (exitCode !== 0) {
+        message = "Could not remove the saved calendar data."
+        try {
+          var r = JSON.parse(wipeOut.text)
+          if (r && r.message) message = String(r.message)
+        } catch (e) {}
+      }
       root.disconnecting = false
-      root.clearCalendar()
+      if (message === "") root.clearCalendar()
+      else root.reload()  // still connected as far as we know: resume refreshing
       if (panelLoader.item && typeof panelLoader.item.finishDisconnect === "function")
-        panelLoader.item.finishDisconnect()
+        panelLoader.item.finishDisconnect(message)
     }
   }
 

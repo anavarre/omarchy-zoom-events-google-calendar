@@ -98,8 +98,8 @@ test("connectCommand keeps the URL out of the arguments and out of a shell", () 
   assert.deepEqual(plain(M.connectEnvironment(url)), { ZOOM_EVENTS_ICS_URL: url })
 })
 
-test("disconnectCommand also forgets the events cache", () => {
-  assert.match(plain(M.disconnectCommand())[2], /events\.json/)
+test("disconnectCommand runs the locked script disconnect", () => {
+  assert.deepEqual(plain(M.disconnectCommand("/x/fetch.py")).slice(-2), ["/x/fetch.py", "--disconnect"])
 })
 
 test("progressText reassures progressively", () => {

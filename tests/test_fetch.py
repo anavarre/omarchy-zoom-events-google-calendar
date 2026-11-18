@@ -2,6 +2,7 @@
 
 Run: python3 -m unittest discover -s tests   (needs python-dateutil)
 """
+import datetime as dt
 import io
 import json
 import os
@@ -124,6 +125,50 @@ class CheckTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(fetch.EVENTS_FILE))
             finally:
                 fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
+    def _isolated(self, d):
+        fetch.CONFIG_FILE = os.path.join(d, "cfg", "ics-url")
+        fetch.CACHE_FILE = os.path.join(d, "cache", "calendar.ics")
+        fetch.EVENTS_FILE = os.path.join(d, "cache", "events.json")
+
+    def test_disconnect_removes_everything_and_cached_needs_connection(self):
+        import tempfile
+        saved = (fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        with tempfile.TemporaryDirectory() as d:
+            self._isolated(d)
+            try:
+                fetch.save_config("https://example.com/basic.ics")
+                fetch.write_cache("x")
+                fetch.write_events([])
+                self.assertEqual(fetch.cached_events(dt.datetime.now(fetch.UTC)), [])
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    self.assertEqual(fetch.disconnect(), 0)
+                self.assertTrue(json.loads(buf.getvalue())["ok"])
+                for f in (fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE):
+                    self.assertFalse(os.path.exists(f))
+                # an events.json left behind without a connection is ignored
+                fetch.write_events([])
+                self.assertIsNone(fetch.cached_events(dt.datetime.now(fetch.UTC)))
+            finally:
+                fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
+    def test_disconnect_reports_deletion_failure(self):
+        import tempfile
+        saved = (fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        with tempfile.TemporaryDirectory() as d:
+            self._isolated(d)
+            try:
+                fetch.save_config("https://example.com/basic.ics")
+                os.makedirs(fetch.CACHE_FILE)  # unlink of a directory fails
+                buf = io.StringIO()
+                with redirect_stdout(buf):
+                    self.assertEqual(fetch.disconnect(), 1)
+                out = json.loads(buf.getvalue())
+                self.assertFalse(out["ok"])
+                self.assertIn("calendar.ics", out["message"])
+            finally:
+                fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
 
     def test_failed_check_saves_nothing(self):
         import tempfile

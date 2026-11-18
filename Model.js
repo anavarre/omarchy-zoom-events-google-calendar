@@ -285,12 +285,10 @@ function successText(meetings) {
     : "Connected. Found " + meetings + " Zoom meeting" + (meetings === 1 ? "" : "s") + " in the next 24 hours."
 }
 
-// Commands that forget the connected calendar: the address and the cached copy.
-function disconnectCommand() {
-  return ["/bin/sh", "-c",
-    'rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-zoom-events-google-calendar/ics-url" ' +
-    '"${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-zoom-events-google-calendar/calendar.ics" ' +
-    '"${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-zoom-events-google-calendar/events.json"']
+// Forget the connected calendar. The script does it under the same lock the
+// refreshes commit under, and prints {"ok": false, "message"} if a file stays.
+function disconnectCommand(script) {
+  return [python, "-I", script, "--disconnect"]
 }
 
 // "Today", "Tomorrow", or e.g. "Thu 20 Nov".

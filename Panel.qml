@@ -198,8 +198,10 @@ Panel {
 
   // Called by the widget once an in-flight refresh is cancelled and the
   // address and caches are gone.
-  function finishDisconnect() {
+  // `message` is empty on success; otherwise the deletion failed and is shown.
+  function finishDisconnect(message) {
     root.disconnecting = false
+    if (message) { root.fail(message); return }
     root.showConfig = true
     root.focusView()
   }
