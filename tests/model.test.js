@@ -56,9 +56,11 @@ test("label with time", () => {
   const now = new Date(2026, 10, 17, 9, 0).getTime()
   const at = (d, h, m) => new Date(2026, 10, d, h, m).getTime()
   const ev = (s, e) => ({ title: "Standup", startMs: s, endMs: e })
-  assert.equal(M.label(ev(at(17, 14, 30), at(17, 15, 0)), 40, now), M.icon + "  14:30  Standup")
+  assert.equal(M.label(ev(at(17, 14, 30), at(17, 15, 0)), 40, now), M.icon + "  5h30mn  Standup")
+  assert.equal(M.label(ev(at(17, 9, 34), at(17, 10, 0)), 40, now), M.icon + "  34mn  Standup")
+  assert.equal(M.label(ev(at(17, 10, 30), at(17, 11, 0)), 40, now), M.icon + "  1h30mn  Standup")
   assert.equal(M.label(ev(at(17, 8, 30), at(17, 9, 30)), 40, now), M.icon + "  Now  Standup")
-  assert.equal(M.label(ev(at(18, 10, 0), at(18, 11, 0)), 40, now), M.icon + "  Wed 10:00  Standup")
+  assert.equal(M.label(ev(at(18, 10, 0), at(18, 11, 0)), 40, now), M.icon + "  1d  Standup")
 })
 
 test("fetchCommand clamps hours", () => {
@@ -86,11 +88,31 @@ test("normalizeIcsUrl accepts only https URLs", () => {
   assert.equal(M.normalizeIcsUrl(""), "")
 })
 
-test("saveCommand passes the URL as an argument", () => {
-  const cmd = plain(M.saveCommand("https://x/$(rm -rf ~)"))
-  assert.equal(cmd[0], "/bin/sh")
-  assert.equal(cmd[cmd.length - 1], "https://x/$(rm -rf ~)")
-  assert.ok(!cmd[2].includes("https://x"))
+test("connectCommand passes the URL as one argument, never through a shell", () => {
+  const cmd = plain(M.connectCommand("/x/fetch.py", "https://x/$(rm -rf ~)"))
+  assert.equal(cmd[0], "/usr/bin/python3")
+  assert.ok(!cmd.includes("/bin/sh"))
+  assert.deepEqual(cmd.slice(-3), ["--check", "https://x/$(rm -rf ~)", "--save"])
+})
+
+test("disconnectCommand also forgets the events cache", () => {
+  assert.match(plain(M.disconnectCommand())[2], /events\.json/)
+})
+
+test("progressText reassures progressively", () => {
+  assert.equal(M.progressText(1).hint, "")
+  assert.match(M.progressText(6).text, /6s/)
+  assert.equal(M.progressText(6).hint, "")
+  assert.match(M.progressText(20).hint, /close this panel/)
+})
+
+test("connectionLabel and tooltip cover connecting and failed", () => {
+  assert.match(M.connectionLabel("connecting", false), /Connecting/)
+  assert.match(M.connectionLabel("finishing", false), /Connecting/)
+  assert.match(M.connectionLabel("", true), /Not connected/)
+  assert.equal(M.connectionLabel("", false), "")
+  assert.match(M.connectionTooltip("", true, "HTTP 404"), /HTTP 404/)
+  assert.equal(M.connectionTooltip("", false, ""), "")
 })
 
 test("parseCheck reads ok and failure results", () => {
@@ -117,6 +139,24 @@ test("successText pluralizes", () => {
 
 test("errorTooltip includes the fetch failure message", () => {
   assert.match(M.errorTooltip("fetch-failed", "HTTP 404"), /HTTP 404/)
+})
+
+test("a feed over the size limit is reported everywhere", () => {
+  const msg = "The calendar is larger than the 100 MB limit, so it was not loaded."
+  assert.match(M.errorTooltip("feed-too-large", msg), /too large[\s\S]*100 MB/)
+  const st = M.status(true, "feed-too-large", msg, true)
+  assert.equal(st.state, "error")
+  assert.equal(st.text, "Calendar too large")
+  assert.match(st.detail, /100 MB.*last calendar/)
+  const now = T("2026-11-17T18:00:00+01:00")
+  const ev = { title: "Sync", startMs: now + 600000, endMs: now + 2400000, zoomUrl: "" }
+  const tip = M.tooltip(ev, now, true, M.errorTooltip("feed-too-large", msg))
+  assert.match(tip, /100 MB/)
+  assert.doesNotMatch(tip, /Offline/)
+  const out = M.parseOutput(JSON.stringify({ error: "feed-too-large", message: msg, stale: true, events: [
+    { title: "Sync", start: "2026-11-17T18:10:00+01:00", end: "2026-11-17T18:40:00+01:00", zoomUrl: "" }] }))
+  assert.equal(out.error, "feed-too-large")
+  assert.equal(out.events.length, 1)
 })
 
 test("agenda lists upcoming meetings across days, capped by count", () => {
@@ -180,4 +220,59 @@ test("readable() lifts low-contrast theme colours and leaves good ones alone", (
   assert.equal(M.readable("#ffffff", "#000000", "#ffffff", 4.5), "#ffffff")
   assert.equal(M.readable("#80ff0000", "#000000", "#ffffff", 1), "#ff0000")
   assert.equal(M.readable("not-a-color", "#000", "#fff", 4.5), "not-a-color")
+})
+
+test("imminent is true only in the minutes before the start", () => {
+  const ev = M.parseOutput(out).events[0] // A starts 14:00+01:00
+  assert.equal(M.imminent(ev, T("2026-11-17T13:54:59+01:00"), 5), false)
+  assert.equal(M.imminent(ev, T("2026-11-17T13:55:00+01:00"), 5), true)
+  assert.equal(M.imminent(ev, T("2026-11-17T13:59:59+01:00"), 5), true)
+  assert.equal(M.imminent(ev, T("2026-11-17T14:00:00+01:00"), 5), false)
+  assert.equal(M.imminent(ev, T("2026-11-17T13:59:00+01:00"), 0), false)
+  assert.equal(M.imminent(null, 0, 5), false)
+})
+
+test("upcoming surfaces the next meeting inside the window, even mid-meeting", () => {
+  const ev = M.parseOutput(out).events // A 14-15, B 15-16, Evil 20-21
+  // In A, B is 6 min away: not yet.
+  assert.equal(M.upcoming(ev, T("2026-11-17T14:54:00+01:00"), 5), null)
+  // In A, B is 5 min away: B takes over and is imminent.
+  const b = M.upcoming(ev, T("2026-11-17T14:55:00+01:00"), 5)
+  assert.equal(b.title, "B")
+  assert.equal(M.imminent(b, T("2026-11-17T14:55:00+01:00"), 5), true)
+  // Once B starts it is no longer "upcoming".
+  assert.equal(M.upcoming(ev, T("2026-11-17T15:00:00+01:00"), 5), null)
+  // Alerts off.
+  assert.equal(M.upcoming(ev, T("2026-11-17T14:58:00+01:00"), 0), null)
+  assert.equal(M.upcoming([], 0, 5), null)
+})
+
+test("only zoom.us hosts are accepted as join links", () => {
+  for (const good of ["https://zoom.us/j/1", "https://acme.zoom.us/j/1?pwd=a", "zoommtg://zoom.us/join?confno=1"])
+    assert.equal(M.safeZoomUrl(good), good)
+  for (const bad of ["https://evilzoom.us/j/1", "https://zoom.us.evil.com/j/1", "https://zoom.us@evil.com/j/1",
+    "http://zoom.us/j/1", "zoommtg://evil.com/join", "https://zoom.us/j/1 --flag", "https://zoom.us/j/1\n", "file:///etc/passwd", "", null])
+    assert.equal(M.safeZoomUrl(bad), "", String(bad))
+  const r = M.parseOutput(JSON.stringify({ events: [
+    { title: "X", start: "2026-11-17T14:00:00Z", end: "2026-11-17T15:00:00Z", zoomUrl: "https://evilzoom.us/j/1" }] }))
+  assert.equal(r.events[0].zoomUrl, "")
+})
+
+test("titles and messages are flattened, stripped of bidi controls and bounded", () => {
+  const r = M.parseOutput(JSON.stringify({ error: "fetch-failed", message: "m".repeat(5000), events: [
+    { title: "a‮gnp.exe\u0000\nb" + "x".repeat(500), start: "2026-11-17T14:00:00Z", end: "2026-11-17T15:00:00Z" },
+    { title: "\u0007", start: "2026-11-17T16:00:00Z", end: "2026-11-17T17:00:00Z" }] }))
+  assert.ok(!/[\u0000-\u001f‮]/.test(r.events[0].title))
+  assert.equal(r.events[0].title.length, 200)
+  assert.equal(r.events[1].title, "Zoom meeting")
+  assert.equal(r.message.length, 300)
+  assert.equal(M.parseCheck('{"ok":false,"message":"a\\nb"}', 0, "").message, "a b")
+})
+
+test("notifications carry no markup and cannot be read as options", () => {
+  const cmd = plain(M.notifyCommand("Title", '-x <a href="http://evil">click</a>'))
+  assert.equal(cmd[3], "--")
+  assert.ok(!/[<>]/.test(cmd[5]))
+  assert.equal(M.normalizeIcsUrl(" https://x.example/a.ics "), "https://x.example/a.ics")
+  assert.equal(M.normalizeIcsUrl("https://x.example/a\u0001.ics"), "")
 })

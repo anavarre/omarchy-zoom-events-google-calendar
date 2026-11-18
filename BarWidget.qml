@@ -16,6 +16,10 @@ BarWidget {
   readonly property int lookaheadHours: Model.clampInt(root.setting("lookaheadHours", 12), 1, 168, 12)
   readonly property int maxTitleLength: Model.clampInt(root.setting("maxTitleLength", 40), 5, 120, 40)
 
+  // Minutes before a meeting starts during which the bar takes the theme's
+  // urgent colour. 0 turns the alert off.
+  readonly property int alertMinutes: Model.clampInt(root.setting("alertMinutes", 5), 0, 60, 5)
+
   readonly property int maxMeetings: Model.clampInt(root.setting("maxMeetings", 5), 1, 10, 5)
   // The panel lists several days ahead; the bar label still honours lookaheadHours.
   readonly property int fetchHours: 168
@@ -28,7 +32,22 @@ BarWidget {
   property real lastFetchMs: 0
   property real nowMs: Date.now()
 
-  readonly property var meeting: Model.pick(root.events, root.nowMs, root.lookaheadHours)
+  // A meeting about to start takes over from the one still running, so it can
+  // alert you while you wrap up.
+  readonly property var meeting: Model.upcoming(root.events, root.nowMs, root.alertMinutes)
+    || Model.pick(root.events, root.nowMs, root.lookaheadHours)
+
+  // Bumped after every finished load, so the panel can tell when a calendar it
+  // just connected is actually on screen.
+  property int loadSerial: 0
+
+  // Connection progress lives in the panel; the bar mirrors it so it stays
+  // visible while the panel is closed.
+  readonly property string connectPhase: panelLoader.item ? panelLoader.item.phase : "idle"
+  readonly property bool connecting: root.connectPhase === "connecting" || root.connectPhase === "finishing"
+  readonly property bool connectFailed: panelLoader.item
+    ? panelLoader.item.failed === true && root.loaded && root.error === "no-config" : false
+  readonly property string connectMessage: panelLoader.item ? panelLoader.item.errorText : ""
 
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
   readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
@@ -74,7 +93,8 @@ BarWidget {
 
   Connections {
     target: panelLoader.item
-    function onSaved() { root.refresh() }
+    function onSaved() { root.reload() }
+    function onDisconnected() { root.clearCalendar() }
   }
 
   implicitWidth: button.visible ? button.implicitWidth : 0
@@ -82,6 +102,8 @@ BarWidget {
 
   // True while the instant cache-only run is in flight.
   property bool cachedRun: false
+  // The calendar changed on disk while a load was running: that load is stale.
+  property bool rerun: false
 
   function refresh() {
     if (fetcher.running || root.script === "") return
@@ -100,6 +122,29 @@ BarWidget {
     fetcher.running = true
   }
 
+  // The calendar was connected or changed. Never drop this request because a
+  // load happens to be running: abandon that load and start over, so the new
+  // calendar shows at once instead of at the next timer tick.
+  function reload() {
+    if (root.script === "") return
+    if (fetcher.running) {
+      root.rerun = true
+      if (typeof fetcher.signal === "function") fetcher.signal(15)
+      return
+    }
+    root.start()
+  }
+
+  function clearCalendar() {
+    root.events = []
+    root.error = "no-config"
+    root.errorMessage = ""
+    root.stale = false
+    root.loaded = true
+    root.loadSerial++
+    root.reload()
+  }
+
   Component.onCompleted: root.start()
 
   Process {
@@ -108,14 +153,25 @@ BarWidget {
     stdout: StdioCollector { id: out; waitForEnd: true }
     stderr: StdioCollector { id: err; waitForEnd: true }
     onExited: function(exitCode) {
+      if (root.rerun) {
+        root.rerun = false
+        root.cachedRun = false
+        root.start()
+        return
+      }
       if (root.cachedRun) {
         root.cachedRun = false
         var cached = Model.parseOutput(out.text)
         if (cached.error === "") {
           root.events = cached.events
+          // The cache is a good calendar, so earlier errors no longer apply.
+          root.error = ""
+          root.errorMessage = ""
+          root.stale = false
           root.loaded = true
           root.nowMs = Date.now()
         }
+        root.loadSerial++
         root.refresh()
         return
       }
@@ -123,14 +179,48 @@ BarWidget {
       if (exitCode !== 0 && result.error === "") result.error = "exit " + exitCode
       if (err.text) console.warn(root.moduleName + ": " + err.text.trim())
       // Keep the last good list on a hard failure; the script already falls
-      // back to its cache for network errors.
-      if (result.error === "" || result.error === "no-config") root.events = result.events
+      // back to its cache for network errors and for a feed over the size limit.
+      var tooLarge = result.error === "feed-too-large"
+      if (result.error === "" || result.error === "no-config" || (tooLarge && result.stale))
+        root.events = result.events
+      // Alert once when the feed first goes over the limit, not on every refresh.
+      if (tooLarge && root.error !== "feed-too-large" && !notifier.running) {
+        notifier.command = Model.notifyCommand("Zoom events",
+          Model.errorTooltip(result.error, result.message))
+        notifier.running = true
+      }
       root.error = result.error
       root.errorMessage = result.message
       root.stale = result.stale
       root.loaded = true
       root.nowMs = Date.now()
+      root.loadSerial++
     }
+  }
+
+  Process { id: notifier; running: false }
+
+  // The last minute before the start: the widget pulses. Off when alerts are.
+  readonly property bool pulsing: root.alertMinutes > 0
+    && Model.imminent(root.meeting, root.nowMs, 1)
+
+  // nowMs only ticks every 30s, so tick each second while a start is close
+  // (nowMs can be 30s stale, hence 95s) to begin and stop the pulse on time.
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.meeting !== null && root.meeting !== undefined
+      && root.meeting.startMs > root.nowMs && root.meeting.startMs - root.nowMs <= 95000
+    onTriggered: root.nowMs = Date.now()
+  }
+
+  // alwaysRunToEnd finishes the current breath, so it always ends fully opaque.
+  SequentialAnimation {
+    running: root.pulsing
+    loops: Animation.Infinite
+    alwaysRunToEnd: true
+    NumberAnimation { target: root; property: "opacity"; to: 0.35; duration: 1600; easing.type: Easing.InOutSine }
+    NumberAnimation { target: root; property: "opacity"; to: 1; duration: 1600; easing.type: Easing.InOutSine }
   }
 
   // Re-evaluates which meeting to show every 30s and refetches when due. Using
@@ -150,9 +240,16 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     // With no meeting, show a dimmed bare icon so the widget stays visible.
-    text: root.meeting ? Model.label(root.meeting, root.maxTitleLength, root.nowMs) : Model.icon
-    dimmed: !root.meeting
-    tooltipText: root.meeting ? Model.tooltip(root.meeting, root.nowMs, root.stale)
+    text: root.connecting ? Model.connectionLabel(root.connectPhase, false)
+      : root.meeting ? Model.label(root.meeting, root.maxTitleLength, root.nowMs)
+      : root.connectFailed ? Model.connectionLabel("", true) : Model.icon
+    dimmed: !root.meeting && !root.connecting
+    // Theme-driven: activeColor defaults to the bar's urgent colour.
+    active: root.meeting ? Model.imminent(root.meeting, root.nowMs, root.alertMinutes) : false
+    tooltipText: root.connecting || (root.connectFailed && !root.meeting)
+      ? Model.connectionTooltip(root.connectPhase, root.connectFailed, root.connectMessage)
+      : root.meeting ? Model.tooltip(root.meeting, root.nowMs, root.stale,
+          root.error === "feed-too-large" ? Model.errorTooltip(root.error, root.errorMessage) : "")
       : Model.errorTooltip(root.error, root.errorMessage)
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) {

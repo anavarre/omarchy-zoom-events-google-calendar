@@ -14,15 +14,20 @@ or, when there is nothing to show at all:
 
   fetch.py --check URL validates a feed before it is saved and prints
   {"ok": true, "meetings": N} or {"ok": false, "message": "..."}.
+  Adding --save also stores the address (mode 0600) and primes both caches from
+  the same download, so connecting needs a single download and the widget can
+  show the meetings immediately.
 
 Only the standard library and python-dateutil are used.
 """
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
 import re
+import signal
 import sys
 import gzip
 import socket
@@ -42,14 +47,58 @@ CACHE_FILE = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), APP, "calendar.ics"
 )
 EVENTS_FILE = os.path.join(os.path.dirname(CACHE_FILE), "events.json")
-MAX_BYTES = 256 * 1024 * 1024
+MAX_BYTES = 100 * 1024 * 1024
 TIMEOUT = 45
+# The socket timeout only bounds each read; this bounds a feed that trickles in.
+DOWNLOAD_SECONDS = 180
 UTC = dt.timezone.utc
 
+# Event fields come from whoever sent the invite, so recurrence expansion is
+# bounded: a rule such as FREQ=SECONDLY from 1900 would otherwise spin for hours.
+EXPAND_SECONDS = 2        # per recurring event
+MAX_SLOW_EVENTS = 5       # after this many hit the limit, stop expanding rules
+MAX_OCCURRENCES = 500     # per recurring event, inside the window
+
+# The host must be zoom.us or a subdomain of it: a looser match would accept
+# look-alikes such as evilzoom.us, and the link is opened on click. zoommtg://
+# is held to the same hosts, as the Zoom client acts on whatever it is handed.
+ZOOM_HOST = r"(?:[A-Za-z0-9-]+\.)*zoom\.us"
 ZOOM_RE = re.compile(
-    r"(?:https://[A-Za-z0-9.-]*zoom\.us/(?:j|my|w|s)/[^\s\"'<>\\]+|zoommtg://[^\s\"'<>\\]+)",
+    r"(?:https://" + ZOOM_HOST + r"/(?:j|my|w|s)/[^\s\"'<>\\]+"
+    r"|zoommtg://" + ZOOM_HOST + r"/[^\s\"'<>\\]+)",
     re.IGNORECASE,
 )
+
+
+class LimitReached(TimeoutError):
+    pass
+
+
+class FeedTooLarge(ValueError):
+    """The feed is bigger than MAX_BYTES once decompressed."""
+
+
+def too_large_message():
+    return (f"The calendar is larger than the {MAX_BYTES // (1024 * 1024)} MB limit, "
+            "so it was not loaded.")
+
+
+@contextlib.contextmanager
+def time_limit(seconds):
+    """Raise LimitReached in the block after `seconds` of wall-clock time."""
+    def expired(_signum, _frame):
+        raise LimitReached("time limit reached")
+    try:
+        previous = signal.signal(signal.SIGALRM, expired)
+    except ValueError:  # not the main thread: no alarm available
+        yield
+        return
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 # --- iCalendar parsing ------------------------------------------------------
@@ -212,6 +261,68 @@ def normalize_until(rule, dtstart):
 
 # --- expansion --------------------------------------------------------------
 
+def expand(props, owner, overridden, now, window_start, window_end, local_tz, recurring=True):
+    """The occurrences of one VEVENT that have not ended, as output dicts."""
+    dtstart_prop = first(props, "DTSTART")
+    if not dtstart_prop:
+        return []
+    status = (first(props, "STATUS") or ({}, ""))[1].upper()
+    response = response_of(props, owner)
+    if status == "CANCELLED" or response == "declined":
+        return []
+    start, all_day = parse_dt(dtstart_prop[1], dtstart_prop[0], local_tz)
+    if all_day:
+        return []
+    link = zoom_link(props)
+    if not link:
+        return []
+
+    end_prop = first(props, "DTEND")
+    if end_prop:
+        duration = parse_dt(end_prop[1], end_prop[0], local_tz)[0] - start
+    else:
+        dur_prop = first(props, "DURATION")
+        duration = (parse_duration(dur_prop[1]) if dur_prop else None) or dt.timedelta(0)
+
+    uid = (first(props, "UID") or ({}, ""))[1]
+    title = unescape((first(props, "SUMMARY") or ({}, ""))[1]).strip() or "Zoom meeting"
+    rule_prop = first(props, "RRULE") if not first(props, "RECURRENCE-ID") else None
+
+    if rule_prop:
+        # No calendar offers sub-hourly repeats; they only serve to burn CPU.
+        if not recurring or re.search(r"FREQ=(?:SECONDLY|MINUTELY)", rule_prop[1], re.IGNORECASE):
+            return []
+        starts = []
+        with time_limit(EXPAND_SECONDS):
+            rs = rrule.rruleset()
+            rs.rrule(rrule.rrulestr(normalize_until(rule_prop[1], start), dtstart=start))
+            for name, params, value in props:
+                if name in ("EXDATE", "RDATE"):
+                    for item in value.split(","):
+                        when, _ = parse_dt(item, params, local_tz)
+                        (rs.exdate if name == "EXDATE" else rs.rdate)(when)
+            for s in rs.xafter(window_start, count=MAX_OCCURRENCES, inc=True):
+                if s > window_end:
+                    break
+                if (uid, s.astimezone(UTC)) not in overridden:
+                    starts.append(s)
+    else:
+        starts = [start] if window_start <= start <= window_end else []
+
+    out = []
+    for s in starts:
+        e = s + duration
+        if e > now:
+            out.append({
+                "title": title,
+                "start": s.astimezone(local_tz).isoformat(),
+                "end": e.astimezone(local_tz).isoformat(),
+                "zoomUrl": link,
+                "response": response,
+            })
+    return out
+
+
 def owner_from_url(url):
     """Google's feed URL is .../ical/<email, percent-encoded>/private-.../basic.ics.
     X-WR-CALNAME is often a display name, so this is the reliable source."""
@@ -233,63 +344,28 @@ def occurrences(text, now, hours, local_tz, owner_hint=""):
         (overrides if first(props, "RECURRENCE-ID") else masters).append(props)
 
     # Instances moved or edited individually: (UID, original start instant).
+    # One malformed event (anyone can send an invite) must not hide the rest,
+    # so each event is handled on its own and skipped if it cannot be read.
     overridden = set()
     for props in overrides:
-        uid = (first(props, "UID") or ({}, ""))[1]
-        p, v = first(props, "RECURRENCE-ID")
-        start, _ = parse_dt(v, p, local_tz)
-        overridden.add((uid, start.astimezone(UTC)))
+        try:
+            uid = (first(props, "UID") or ({}, ""))[1]
+            p, v = first(props, "RECURRENCE-ID")
+            start, _ = parse_dt(v, p, local_tz)
+            overridden.add((uid, start.astimezone(UTC)))
+        except Exception:
+            continue
 
-    out = []
+    out, slow = [], 0
     for props in masters + overrides:
-        dtstart_prop = first(props, "DTSTART")
-        if not dtstart_prop:
+        try:
+            out.extend(expand(props, owner, overridden, now, window_start, window_end,
+                              local_tz, slow < MAX_SLOW_EVENTS))
+        except LimitReached:
+            slow += 1
+            print(f"{APP}: skipped an event whose recurrence took too long", file=sys.stderr)
+        except Exception:
             continue
-        status = (first(props, "STATUS") or ({}, ""))[1].upper()
-        response = response_of(props, owner)
-        if status == "CANCELLED" or response == "declined":
-            continue
-        start, all_day = parse_dt(dtstart_prop[1], dtstart_prop[0], local_tz)
-        if all_day:
-            continue
-        link = zoom_link(props)
-        if not link:
-            continue
-
-        end_prop = first(props, "DTEND")
-        if end_prop:
-            duration = parse_dt(end_prop[1], end_prop[0], local_tz)[0] - start
-        else:
-            dur_prop = first(props, "DURATION")
-            duration = (parse_duration(dur_prop[1]) if dur_prop else None) or dt.timedelta(0)
-
-        uid = (first(props, "UID") or ({}, ""))[1]
-        title = unescape((first(props, "SUMMARY") or ({}, ""))[1]).strip() or "Zoom meeting"
-        rule_prop = first(props, "RRULE") if not first(props, "RECURRENCE-ID") else None
-
-        if rule_prop:
-            rs = rrule.rruleset()
-            rs.rrule(rrule.rrulestr(normalize_until(rule_prop[1], start), dtstart=start))
-            for name, params, value in props:
-                if name in ("EXDATE", "RDATE"):
-                    for item in value.split(","):
-                        when, _ = parse_dt(item, params, local_tz)
-                        (rs.exdate if name == "EXDATE" else rs.rdate)(when)
-            starts = [s for s in rs.between(window_start, window_end, inc=True)
-                      if (uid, s.astimezone(UTC)) not in overridden]
-        else:
-            starts = [start] if window_start <= start <= window_end else []
-
-        for s in starts:
-            e = s + duration
-            if e > now:
-                out.append({
-                    "title": title,
-                    "start": s.astimezone(local_tz).isoformat(),
-                    "end": e.astimezone(local_tz).isoformat(),
-                    "zoomUrl": link,
-                    "response": response,
-                })
 
     out.sort(key=lambda ev: (ev["start"], ev["title"]))
     return out
@@ -297,13 +373,23 @@ def occurrences(text, now, hours, local_tz, owner_hint=""):
 
 # --- I/O --------------------------------------------------------------------
 
+def valid_url(url):
+    """An https URL with a host and no whitespace or control characters."""
+    if not re.fullmatch(r"https://[\x21-\x7e]+", url or "", re.IGNORECASE):
+        return False
+    try:
+        return bool(urllib.parse.urlsplit(url).hostname)
+    except ValueError:
+        return False
+
+
 def read_url():
     try:
         with open(CONFIG_FILE, encoding="utf-8") as f:
             url = f.read().strip()
     except OSError:
         return None
-    return url if url.startswith("https://") else None
+    return url if valid_url(url) else None
 
 
 _getaddrinfo = socket.getaddrinfo
@@ -315,17 +401,33 @@ def _ipv4_first(*args, **kwargs):
     return sorted(infos, key=lambda i: i[0] != socket.AF_INET)
 
 
+class HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib follows redirects to http:// and ftp:// by default, which would
+    send the request, and bring the calendar back, in the clear."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not valid_url(newurl):
+            raise urllib.error.URLError("the server redirected away from https")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def download(url):
+    if not valid_url(url):
+        raise ValueError("not an https address")
     socket.getaddrinfo = _ipv4_first
     req = urllib.request.Request(
         url, headers={"User-Agent": APP, "Accept-Encoding": "gzip"}
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        data = resp.read(MAX_BYTES + 1)
-        if resp.headers.get("Content-Encoding") == "gzip":
-            data = gzip.decompress(data)
+    opener = urllib.request.build_opener(HttpsOnlyRedirect)
+    with time_limit(DOWNLOAD_SECONDS), opener.open(req, timeout=TIMEOUT) as resp:
+        stream = resp
+        if (resp.headers.get("Content-Encoding") or "").strip().lower() == "gzip":
+            # Decompress as a stream so the size cap applies to the expanded
+            # data: a small gzip body can otherwise inflate to fill the memory.
+            stream = gzip.GzipFile(fileobj=resp)
+        data = stream.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
-        raise ValueError("feed too large")
+        raise FeedTooLarge("feed too large")
     text = data.decode("utf-8", errors="replace")
     if "BEGIN:VCALENDAR" not in text:
         raise ValueError("not an iCalendar feed")
@@ -343,6 +445,10 @@ def describe_error(exc):
             return "Google is rate limiting requests (HTTP 429). Try again in a minute."
         return f"The server answered with an error (HTTP {exc.code})."
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(reason, FeedTooLarge):
+        return too_large_message()
+    if isinstance(reason, LimitReached):
+        return "The server did not answer in time: the download took too long."
     if isinstance(reason, (socket.timeout, TimeoutError)):
         return f"The server did not answer within {TIMEOUT} seconds."
     if isinstance(reason, socket.gaierror):
@@ -354,32 +460,73 @@ def describe_error(exc):
     return f"Could not download the calendar: {reason}"
 
 
-def check(url, hours, local_tz):
-    """Validate a feed before it is saved: download, parse, count meetings.
+def write_private(path, write):
+    """Write `path` atomically, readable by the owner only. The directory is
+    made (or tightened to) 0700 and mkstemp creates the file as 0600; a failed
+    write leaves no temporary copy of the calendar behind."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            write(f)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def save_config(url):
+    write_private(CONFIG_FILE, lambda f: f.write(url + "\n"))
+
+
+def check(url, hours, local_tz, save=False):
+    """Validate a feed: download, parse, count meetings. With save=True, also
+    persist the address and prime the caches from this same download.
     Prints {"ok": true, "meetings": N} or {"ok": false, "message": "..."}."""
-    if not url.startswith("https://"):
+    if not url.lower().startswith("https://"):
         print(json.dumps({"ok": False, "message": "The address must start with https://"}))
+        return 0
+    if not valid_url(url):
+        print(json.dumps({"ok": False, "message": "That is not a valid address."}))
         return 0
     try:
         text = download(url)
     except Exception as exc:
         print(json.dumps({"ok": False, "message": describe_error(exc)}))
         return 0
+    now = dt.datetime.now(UTC)
+    window = 24 * 7 if save else hours
     try:
-        events = occurrences(text, dt.datetime.now(UTC), hours, local_tz, owner_from_url(url))
+        events = occurrences(text, now, window, local_tz, owner_from_url(url))
     except Exception as exc:
-        print(json.dumps({"ok": False, "message": f"The calendar downloaded but could not be read: {exc}"}))
+        # The exception quotes feed content, so it goes to the log, not the UI.
+        print(f"{APP}: parse failed: {exc}", file=sys.stderr)
+        print(json.dumps({"ok": False, "message": "The calendar downloaded but could not be read."}))
         return 0
-    print(json.dumps({"ok": True, "meetings": len(events)}))
+    if save:
+        try:
+            write_cache(text)
+            write_events(events)
+            save_config(url)  # last: a half-written state never looks configured
+        except OSError as exc:
+            print(json.dumps({"ok": False, "message":
+                              f"The calendar works, but the address could not be saved ({exc}). "
+                              "Check that ~/.config is writable, then try again."}))
+            return 0
+    horizon = now + dt.timedelta(hours=hours)
+    soon = [e for e in events if dt.datetime.fromisoformat(e["start"]) <= horizon]
+    print(json.dumps({"ok": True, "meetings": len(soon)}))
     return 0
 
 
 def write_cache(text):
-    os.makedirs(os.path.dirname(CACHE_FILE), mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_FILE))
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, CACHE_FILE)
+    write_private(CACHE_FILE, lambda f: f.write(text))
 
 
 def read_cache():
@@ -394,11 +541,7 @@ def write_events(events):
     """Cache the expanded meeting list so --cached can answer instantly: the
     raw feed can be tens of MB and take half a minute to download."""
     try:
-        os.makedirs(os.path.dirname(EVENTS_FILE), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(EVENTS_FILE))
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(events, f)
-        os.replace(tmp, EVENTS_FILE)
+        write_private(EVENTS_FILE, lambda f: json.dump(events, f))
     except OSError as exc:
         print(f"{APP}: could not write events cache: {exc}", file=sys.stderr)
 
@@ -418,6 +561,8 @@ def main(argv=None):
     ap.add_argument("--now", help="pretend it is this ISO 8601 instant")
     ap.add_argument("--hours", type=int, default=24)
     ap.add_argument("--check", metavar="URL", help="validate this feed URL and exit")
+    ap.add_argument("--save", action="store_true",
+                    help="with --check: also store the address and prime the caches")
     ap.add_argument("--cached", action="store_true",
                     help="answer from the local cache only, never the network")
     ap.add_argument("--tz", help="local IANA zone (default: system)")
@@ -429,7 +574,7 @@ def main(argv=None):
         now = now.replace(tzinfo=local_tz)
 
     if args.check:
-        return check(args.check, max(1, min(args.hours, 24 * 7)), local_tz)
+        return check(args.check, max(1, min(args.hours, 24 * 7)), local_tz, args.save)
 
     if args.cached:
         events = cached_events(now)
@@ -440,6 +585,7 @@ def main(argv=None):
         return 0
 
     stale = False
+    failure = {}
     if args.ics:
         with open(args.ics, encoding="utf-8") as f:
             text = f.read()
@@ -455,9 +601,13 @@ def main(argv=None):
             print(f"{APP}: fetch failed: {exc}", file=sys.stderr)
             text = read_cache()
             stale = True
+            if isinstance(exc, FeedTooLarge):
+                # Not a passing outage: the cached meetings are still shown,
+                # but the error is reported so the user hears about it.
+                failure = {"error": "feed-too-large", "message": describe_error(exc)}
             if text is None:
                 print(json.dumps({"events": [], "error": "fetch-failed",
-                                  "message": describe_error(exc)}))
+                                  "message": describe_error(exc), **failure}))
                 return 0
 
     try:
@@ -470,7 +620,7 @@ def main(argv=None):
 
     if not args.ics and not stale:
         write_events(events)
-    print(json.dumps({"events": events, "stale": stale}))
+    print(json.dumps({"events": events, "stale": stale, **failure}))
     return 0
 
 

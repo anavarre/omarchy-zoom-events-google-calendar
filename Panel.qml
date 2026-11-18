@@ -6,8 +6,20 @@ import qs.Ui
 import "Model.js" as Model
 
 // Setup form shown when no calendar is configured: paste the Google Calendar
-// secret iCal address, press Enter (or Save) to store it, and the widget
-// refetches.
+// secret iCal address and press Enter (or Connect). One script run downloads
+// and validates the feed, stores the address and primes the caches, then the
+// widget shows the cached meetings at once.
+//
+// The connection is a visible state machine, so it can never look like nothing
+// happened: idle -> connecting (download + check, bounded by a timeout)
+// -> finishing (waiting for the widget to show the new calendar) -> idle.
+// Progress and outcome are mirrored on the bar, survive closing the panel, and
+// a failure keeps its message until the user acts on it.
+//
+// Meeting titles and error text come from the calendar feed, which anyone who
+// sends an invite can write to, so every Text here is Text.PlainText: the
+// default AutoText would render a title like <img src="http://…"> as markup
+// and fetch the image.
 Panel {
   id: root
   moduleName: "anavarre.zoom-events-google-calendar"
@@ -16,8 +28,11 @@ Panel {
   property var anchorItem: null
   property var hostWidget: null
 
-  // idle -> checking (download + parse) -> saving -> idle (back on the main view)
   property string phase: "idle"
+  // The last connection attempt failed and has not been fixed yet (the bar mirrors this).
+  property bool failed: false
+  // Seconds spent in the current attempt.
+  property int elapsed: 0
   // The main view (status + meetings) is the default; the form lives behind the cogwheel.
   property bool showConfig: false
   readonly property var host: root.hostWidget
@@ -27,12 +42,14 @@ Panel {
     : Model.status(false, "", "", false)
   readonly property bool connected: root.status.state === "ok"
 
-  readonly property bool busy: phase === "checking" || phase === "saving"
+  readonly property bool busy: phase !== "idle"
+  readonly property var progress: Model.progressText(root.elapsed)
   property string errorText: ""
   property string successText: ""
   readonly property string script: Model.localPath(Qt.resolvedUrl("scripts/fetch.py"))
 
   signal saved()
+  signal disconnected()
 
   // Named text sizes; every font size in the panel is scaled by the factor.
   property string textSize: "medium"
@@ -81,20 +98,19 @@ Panel {
     return false
   }
 
-  property string pendingUrl: ""
   // An outcome arrived while the panel was closed and has not been shown yet.
   property bool unseen: false
 
   // Desktop notification, used when a background result lands with the panel closed.
   function notify(title, body) {
-    notifier.command = ["notify-send", "-a", "Zoom events", title, body]
+    notifier.command = Model.notifyCommand(title, body)
     notifier.running = true
   }
 
   Process { id: notifier; running: false; command: [] }
 
   function save() {
-    if (root.busy) return
+    if (root.busy || checker.running) return
     var url = Model.normalizeIcsUrl(field.text)
     if (url === "") {
       root.errorText = field.text.trim() === ""
@@ -108,24 +124,54 @@ Panel {
     }
     root.errorText = ""
     root.successText = ""
-    root.pendingUrl = url
-    root.phase = "checking"
-    checker.command = Model.checkCommand(root.script, url)
+    root.failed = false
+    root.elapsed = 0
+    root.phase = "connecting"
+    checker.command = Model.connectCommand(root.script, url)
     checker.running = true
   }
 
+  // A failed attempt: keep the message and the typed address, return to the form.
+  function fail(message) {
+    root.phase = "idle"
+    root.failed = true
+    root.successText = ""
+    root.errorText = message
+    root.showConfig = true
+    if (!root.opened) {
+      root.unseen = true
+      root.notify("Calendar could not be connected",
+        message + "\nClick the calendar widget to fix the address and try again.")
+    }
+    root.focusView()
+  }
+
+  // The new calendar is on screen: report success.
+  function finishConnect() {
+    settleTimer.stop()
+    field.text = ""
+    root.phase = "idle"
+    root.showConfig = false
+    if (!root.opened) {
+      root.unseen = true
+      root.notify("Calendar connected", root.successText)
+    }
+    root.focusView()
+  }
+
   onOpenedChanged: {
-    // A check keeps running in the background while the panel is closed;
-    // reopening must show its progress or outcome, not reset it.
+    // A connection keeps running while the panel is closed; reopening must
+    // show its progress or outcome, not reset it.
     if (opened) {
+      var hadOutcome = root.unseen
       root.unseen = false
-      // Always land on the main view, unless a check is still running.
-      if (!root.busy) root.showConfig = false
+      // The main view is the default; a failure that happened while away
+      // reopens straight on the form so it can be fixed.
+      if (!root.busy) root.showConfig = hadOutcome && root.errorText !== ""
       root.focusView()
     } else if (!root.busy && !root.unseen) {
-      root.errorText = ""
+      // A confirmation is shown once; errors stay until acted on.
       root.successText = ""
-      root.phase = "idle"
     }
   }
 
@@ -135,7 +181,6 @@ Panel {
 
   function toggleConfig() {
     root.showConfig = !root.showConfig
-    if (root.showConfig) { root.errorText = ""; root.successText = "" }
     root.focusView()
   }
 
@@ -143,6 +188,7 @@ Panel {
     if (root.busy) return
     root.errorText = ""
     root.successText = ""
+    root.failed = false
     disconnector.running = true
   }
 
@@ -152,12 +198,43 @@ Panel {
     command: Model.disconnectCommand()
     onExited: function() {
       root.showConfig = true
-      root.saved()
+      root.disconnected()
       root.focusView()
     }
   }
 
-  // Step 1: download and parse the feed without saving anything.
+  // Ticks while a connection runs: drives the elapsed counter and enforces the
+  // overall timeout, which the download's own socket timeout does not bound.
+  Timer {
+    interval: 1000
+    running: root.phase === "connecting"
+    repeat: true
+    onTriggered: {
+      root.elapsed++
+      if (root.elapsed < Model.connectTimeoutSeconds) return
+      if (typeof checker.signal === "function") checker.signal(15)
+      root.fail("Google did not finish answering within " + Model.connectTimeoutSeconds +
+        " seconds. Check your network connection and try again.")
+    }
+  }
+
+  // Safety net: if the widget never reports a finished load, do not hang.
+  Timer {
+    id: settleTimer
+    interval: 8000
+    repeat: false
+    onTriggered: if (root.phase === "finishing") root.finishConnect()
+  }
+
+  Connections {
+    target: root.host
+    function onLoadSerialChanged() {
+      if (root.phase === "finishing") root.finishConnect()
+    }
+  }
+
+  // Downloads and validates the feed; on success it has also stored the
+  // address and primed the caches (see fetch.py --check --save).
   Process {
     id: checker
     running: false
@@ -165,52 +242,13 @@ Panel {
     stdout: StdioCollector { id: checkOut; waitForEnd: true }
     stderr: StdioCollector { id: checkErr; waitForEnd: true }
     onExited: function(exitCode) {
+      if (root.phase !== "connecting") return   // timed out or superseded
       var r = Model.parseCheck(checkOut.text, exitCode, checkErr.text)
-      if (!r.ok) {
-        root.phase = "idle"
-        root.errorText = r.message
-        if (!root.opened) {
-          root.unseen = true
-          root.notify("Calendar could not be connected",
-            r.message + "\nClick the calendar widget to fix the address and try again.")
-        }
-        return
-      }
+      if (!r.ok) { root.fail(r.message); return }
       root.successText = Model.successText(r.meetings)
-      root.phase = "saving"
-      saver.command = Model.saveCommand(root.pendingUrl)
-      saver.running = true
-    }
-  }
-
-  // Step 2: only a verified address is written to disk.
-  Process {
-    id: saver
-    running: false
-    command: []
-    stderr: StdioCollector { id: saverErr; waitForEnd: true }
-    onExited: function(exitCode) {
-      if (exitCode !== 0) {
-        root.phase = "idle"
-        root.successText = ""
-        root.errorText = "The calendar works, but the address could not be saved" +
-          (saverErr.text ? ": " + saverErr.text.trim() : ".") +
-          " Check that ~/.config is writable, then try again."
-        if (!root.opened) {
-          root.unseen = true
-          root.notify("Calendar could not be saved", root.errorText)
-        }
-        return
-      }
-      field.text = ""
+      root.phase = "finishing"
+      settleTimer.restart()
       root.saved()
-      root.phase = "idle"
-      root.showConfig = false
-      if (!root.opened) {
-        root.notify("Calendar connected", root.successText)
-        root.successText = ""
-      }
-      root.focusView()
     }
   }
 
@@ -241,14 +279,18 @@ Panel {
 
       // Header: connection status.
       Text {
+        textFormat: Text.PlainText
         id: statusText
         width: parent.width - cog.width - Style.space(8)
         // The agenda already shows the calendar is working, so skip "Connected".
-        visible: !root.showConfig && !(root.connected && root.agenda.length > 0)
-        elide: Text.ElideRight
-        text: (root.status.state === "ok" ? "✓ " : root.status.state === "error" ? "✗ " : "") + root.status.text
-        color: root.status.state === "error" ? root.urgent
-          : root.status.state === "ok" ? root.accent : root.foreground
+        // Hidden while a connection runs (the progress block says it better).
+        visible: !root.showConfig && !root.busy
+          && (root.successText !== "" || !(root.connected && root.agenda.length > 0))
+        wrapMode: Text.WordWrap
+        text: root.successText !== "" ? "✓ " + root.successText
+          : (root.status.state === "ok" ? "✓ " : root.status.state === "error" ? "✗ " : "") + root.status.text
+        color: root.status.state === "error" && root.successText === "" ? root.urgent
+          : root.status.state === "ok" || root.successText !== "" ? root.accent : root.foreground
         font.family: root.fontFamily
         font.pixelSize: root.fs(Style.font.body)
         font.bold: true
@@ -261,6 +303,7 @@ Panel {
         visible: root.showConfig
 
         Text {
+          textFormat: Text.PlainText
           id: settingsTitle
           anchors.left: parent.left
           anchors.right: closeCross.left
@@ -275,6 +318,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           id: closeCross
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
@@ -293,11 +337,63 @@ Panel {
         }
       }
 
+      // ---------- Progress (both views) ----------
+      // Shown whenever a connection runs, wherever the user is in the panel.
+      Column {
+        width: parent.width
+        visible: root.busy
+        spacing: Style.space(4)
+
+        Row {
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            id: spinner
+            text: "◜"
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.body)
+            anchors.verticalCenter: parent.verticalCenter
+            property int frame: 0
+            readonly property var frames: ["◜", "◝", "◞", "◟"]
+            Timer {
+              interval: 120
+              running: root.busy
+              repeat: true
+              onTriggered: { spinner.frame = (spinner.frame + 1) % 4; spinner.text = spinner.frames[spinner.frame] }
+            }
+          }
+          Text {
+            textFormat: Text.PlainText
+            text: root.phase === "finishing" ? "Loading your meetings…" : root.progress.text
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.body)
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          visible: root.phase === "connecting" && root.progress.hint !== ""
+          text: root.progress.hint
+          color: root.foreground
+          opacity: 0.85
+          font.family: root.fontFamily
+          font.pixelSize: root.fs(Style.font.caption)
+          wrapMode: Text.WordWrap
+        }
+      }
+
       // ---------- Main view ----------
       Text {
+        textFormat: Text.PlainText
         width: parent.width
-        visible: !root.showConfig && (root.status.detail !== "" || root.successText !== "")
-        text: root.successText !== "" ? root.successText : root.status.detail
+        visible: !root.showConfig && !root.busy && root.successText === "" && root.status.detail !== ""
+        text: root.status.detail
         color: root.foreground
         opacity: 0.9
         font.family: root.fontFamily
@@ -306,8 +402,9 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         width: parent.width
-        visible: !root.showConfig && root.errorText !== ""
+        visible: !root.showConfig && !root.busy && root.errorText !== ""
         text: "✗ " + root.errorText
         color: root.urgent
         font.family: root.fontFamily
@@ -329,6 +426,7 @@ Panel {
             height: modelData.kind === "day" ? dayText.implicitHeight + Style.space(4) : meetingRow.implicitHeight + Style.space(4)
 
             Text {
+              textFormat: Text.PlainText
               id: dayText
               visible: modelData.kind === "day"
               anchors.bottom: parent.bottom
@@ -353,6 +451,7 @@ Panel {
                 text: "00:00–00:00"
               }
               Text {
+                textFormat: Text.PlainText
                 id: timeText
                 anchors.left: parent.left
                 // Share the title's baseline so both read as one line at any text size.
@@ -365,17 +464,38 @@ Panel {
                 font.pixelSize: root.fs(Style.font.caption)
               }
               Text {
+                textFormat: Text.PlainText
                 id: titleText
                 anchors.left: timeText.right
                 anchors.leftMargin: Style.space(8)
-                anchors.right: parent.right
+                // Titles are trimmed to leave the right-hand RSVP column free.
+                anchors.right: markText.left
+                anchors.rightMargin: Style.space(8)
                 anchors.top: parent.top
                 text: (modelData.running ? "● " : "") + (modelData.title || "")
-                      + (Model.responseMark(modelData.response) ? "  " + Model.responseMark(modelData.response) : "")
                 elide: Text.ElideRight
                 color: rowArea.containsMouse && modelData.zoomUrl ? root.accent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: root.fs(Style.font.body)
+              }
+              // RSVP column: always flush right, so marks line up on every row.
+              Text {
+                textFormat: Text.PlainText
+                id: markText
+                anchors.right: parent.right
+                anchors.baseline: titleText.baseline
+                width: Math.ceil(markMetrics.advanceWidth)
+                horizontalAlignment: Text.AlignRight
+                text: Model.responseMark(modelData.response)
+                color: modelData.response === "accepted" ? root.accent : root.foreground
+                opacity: modelData.response === "accepted" ? 1 : 0.85
+                font.family: root.fontFamily
+                font.pixelSize: root.fs(Style.font.body)
+              }
+              TextMetrics {
+                id: markMetrics
+                font: markText.font
+                text: "✓"
               }
             }
 
@@ -391,8 +511,9 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
-          visible: root.connected && root.agenda.length === 0
+          visible: root.connected && !root.busy && root.agenda.length === 0
           text: "No upcoming Zoom meetings in the next 7 days."
           color: root.foreground
           opacity: 0.9
@@ -412,6 +533,7 @@ Panel {
           visible: root.connected
           spacing: Style.space(8)
           Text {
+            textFormat: Text.PlainText
             anchors.verticalCenter: parent.verticalCenter
             text: "✓ A calendar is connected."
             color: root.accent
@@ -427,6 +549,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: !root.connected
           text: "Secret address in iCal format"
@@ -460,46 +583,17 @@ Panel {
           Button {
             id: saveButton
             anchors.verticalCenter: field.verticalCenter
-            text: root.connected ? "Reconnect" : "Save"
+            text: root.failed ? "Try again" : "Connect"
             enabled: !root.busy
             foreground: root.foreground
             onClicked: root.save()
           }
         }
 
-        // Immediate feedback while the feed downloads.
-        Row {
-          visible: root.busy
-          spacing: Style.space(8)
-
-          Text {
-            id: spinner
-            text: "◜"
-            color: root.accent
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(Style.font.body)
-            anchors.verticalCenter: parent.verticalCenter
-            property int frame: 0
-            readonly property var frames: ["◜", "◝", "◞", "◟"]
-            Timer {
-              interval: 120
-              running: root.busy
-              repeat: true
-              onTriggered: { spinner.frame = (spinner.frame + 1) % 4; spinner.text = spinner.frames[spinner.frame] }
-            }
-          }
-          Text {
-            text: root.phase === "saving" ? "Saving…" : "Checking the calendar…"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: root.fs(Style.font.caption)
-            anchors.verticalCenter: parent.verticalCenter
-          }
-        }
-
         Text {
+          textFormat: Text.PlainText
           width: parent.width
-          visible: root.errorText !== ""
+          visible: root.errorText !== "" && !root.busy
           text: "✗ " + root.errorText
           color: root.urgent
           font.family: root.fontFamily
@@ -512,6 +606,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             text: "Open Google Calendar settings"
             color: root.accent
             font.family: root.fontFamily
@@ -526,6 +621,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "(Docs)"
             color: root.accent
             font.family: root.fontFamily
@@ -551,6 +647,7 @@ Panel {
         spacing: Style.space(8)
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: "Display"
           color: root.accent
@@ -564,6 +661,7 @@ Panel {
           height: Math.max(textSizeCaption.implicitHeight, textSizeControls.implicitHeight)
 
           Text {
+            textFormat: Text.PlainText
             id: textSizeCaption
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
@@ -594,6 +692,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               width: Math.max(Style.space(Math.round(70 * root.textScale)), implicitWidth)
               horizontalAlignment: Text.AlignHCenter
@@ -622,6 +721,7 @@ Panel {
     // The cogwheel sits top right, vertically centred on the first visible header
     // (connection status, or the first day heading such as "Today"/"Tomorrow").
     Text {
+      textFormat: Text.PlainText
       id: cog
       readonly property var firstDay: agendaRepeater.count > 0 ? agendaRepeater.itemAt(0) : null
       anchors.right: parent.right

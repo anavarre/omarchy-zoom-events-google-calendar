@@ -1,7 +1,7 @@
 # Zoom Events for Google Calendar
 
 An Omarchy bar widget that shows your current or next Zoom meeting as
-` <when> <meeting title>` (`Now`, `14:30`, or `Wed 10:00`), read from your Google Calendar. Left click always opens the panel (paste your calendar's secret iCal address,
+` <when> <meeting title>` (`Now`, `18mn`, `1h34mn`, or `2d`), read from your Google Calendar. Left click always opens the panel (paste your calendar's secret iCal address,
 see errors, jump to Google Calendar settings); right click refreshes. The widget hides itself when nothing is
 coming up.
 
@@ -19,7 +19,11 @@ events that have a Zoom link.
    Secret address in iCal format**, and copy it. If the field is missing, your
    Workspace admin has disabled it.
 2. Click the widget, paste the address into the form and press Enter (or
-   **Save**). It is stored with mode 0600. Or save it yourself:
+   **Connect**). The feed is downloaded and checked once; only a working
+   address is stored (mode 0600). Large calendars can take up to a minute: you
+   can close the panel, the bar shows `Connecting…`, and a notification reports
+   the result. A failure keeps its message and your pasted address, and
+   reopening the panel lands on the form. Or save the address yourself:
 
    ```sh
    install -Dm600 /dev/stdin ~/.config/omarchy-zoom-events-google-calendar/ics-url <<< 'https://calendar.google.com/calendar/ical/…/basic.ics'
@@ -49,10 +53,15 @@ events that have a Zoom link.
 | `refreshMinutes` | 10 | how often the feed is downloaded |
 | `lookaheadHours` | 12 | only show meetings starting within this window |
 | `maxTitleLength` | 40 | titles longer than this are truncated |
+| `alertMinutes` | 5 | the bar takes the theme's urgent colour this many minutes before a meeting starts (0 turns it off); in the last minute the widget also pulses until the meeting starts |
 | `maxMeetings` | 5 | meetings listed in the panel (1-10), across as many days as needed |
 
 If the download fails, the last good copy in
 `~/.cache/omarchy-zoom-events-google-calendar/calendar.ics` is used.
+
+Feeds larger than 100 MB (after decompression) are not loaded. You get a
+notification, the panel and the tooltip say so, and the last good copy stays on
+screen.
 
 ## Dependencies
 

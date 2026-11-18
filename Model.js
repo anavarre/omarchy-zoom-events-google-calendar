@@ -26,6 +26,25 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n))
 }
 
+// Text that arrives from the calendar (titles are written by whoever sent the
+// invite) or from an error: one line, no control characters, no bidi overrides
+// that could reorder what is shown, and a bounded length.
+function clean(text, maxLength) {
+  var s = String(text === undefined || text === null ? "" : text)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ")
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "")
+    .trim()
+  return s.length > maxLength ? s.slice(0, maxLength - 1) + "…" : s
+}
+
+// Only zoom.us and its subdomains: a looser host match would accept look-alike
+// domains such as evilzoom.us, and this is the link a click opens.
+function safeZoomUrl(url) {
+  var s = String(url || "")
+  if (!/^[\x21-\x7e]{1,2048}$/.test(s)) return ""
+  return /^(https|zoommtg):\/\/([a-z0-9-]+\.)*zoom\.us\//i.test(s) ? s : ""
+}
+
 // -> { events: [{title, startMs, endMs, zoomUrl}], error: "", message: "", stale: bool }
 function parseOutput(text) {
   var result = { events: [], error: "", message: "", stale: false }
@@ -35,8 +54,8 @@ function parseOutput(text) {
     return result
   }
   if (!data || typeof data !== "object") { result.error = "bad-output"; return result }
-  result.error = typeof data.error === "string" ? data.error : ""
-  result.message = typeof data.message === "string" ? data.message : ""
+  result.error = typeof data.error === "string" ? clean(data.error, 40) : ""
+  result.message = typeof data.message === "string" ? clean(data.message, 300) : ""
   result.stale = data.stale === true
   var list = Array.isArray(data.events) ? data.events : []
   for (var i = 0; i < list.length; i++) {
@@ -44,11 +63,9 @@ function parseOutput(text) {
     var startMs = Date.parse(ev.start)
     var endMs = Date.parse(ev.end)
     if (!isFinite(startMs) || !isFinite(endMs)) continue
-    var url = String(ev.zoomUrl || "")
-    if (!/^(https:\/\/[A-Za-z0-9.-]*zoom\.us\/|zoommtg:\/\/)/i.test(url)) url = ""
     result.events.push({
-      title: String(ev.title || "Zoom meeting").replace(/[\r\n\t]+/g, " ").trim(),
-      startMs: startMs, endMs: endMs, zoomUrl: url,
+      title: clean(ev.title, 200) || "Zoom meeting",
+      startMs: startMs, endMs: endMs, zoomUrl: safeZoomUrl(ev.zoomUrl),
       response: /^(accepted|tentative|needs-action)$/.test(ev.response) ? ev.response : ""
     })
   }
@@ -72,19 +89,43 @@ function pick(events, nowMs, lookaheadHours) {
   return current
 }
 
+// The first meeting that has not started yet but starts within `minutes`, even
+// while another one is running, so the next meeting can alert you as you wrap
+// up. null when alerts are off (0) or nothing is that close.
+function upcoming(events, nowMs, minutes) {
+  var window = clampInt(minutes, 0, 60, 5) * 60000
+  if (window <= 0) return null
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i]
+    if (ev.startMs <= nowMs) continue
+    return ev.startMs - nowMs <= window ? ev : null
+  }
+  return null
+}
+
+// True while the meeting has not started but starts within `minutes`, so the
+// bar can colour itself in the run-up. Not true once it is running.
+function imminent(ev, nowMs, minutes) {
+  if (!ev || ev.startMs <= nowMs) return false
+  return ev.startMs - nowMs <= clampInt(minutes, 0, 60, 5) * 60000
+}
+
 function truncate(title, maxLength) {
   var max = clampInt(maxLength, 5, 120, 40)
   var s = String(title || "")
   return s.length > max ? s.slice(0, max - 1).replace(/\s+$/, "") + "…" : s
 }
 
-// When the meeting happens, for the bar: "Now", "14:30", or "Tue 14:30".
+// How far away the meeting is, compact for the bar:
+// "Now", "18mn", "1h34mn", "2h", "2d".
 function whenText(ev, nowMs) {
   if (ev.startMs <= nowMs) return "Now"
-  var days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-  var d = new Date(ev.startMs)
-  var sameDay = d.toDateString() === new Date(nowMs).toDateString()
-  return (sameDay ? "" : days[d.getDay()] + " ") + clock(ev.startMs)
+  var mins = Math.ceil((ev.startMs - nowMs) / 60000)
+  if (mins < 60) return mins + "mn"
+  var hours = Math.floor(mins / 60)
+  if (hours >= 24) return Math.floor(hours / 24) + "d"
+  var rest = mins % 60
+  return hours + "h" + (rest ? (rest < 10 ? "0" : "") + rest + "mn" : "")
 }
 
 function label(ev, maxLength, nowMs) {
@@ -111,7 +152,9 @@ function clock(ms) {
   return pad(d.getHours()) + ":" + pad(d.getMinutes())
 }
 
-function tooltip(ev, nowMs, stale) {
+// `note` replaces the offline line when the cached calendar is shown for
+// another reason, such as a feed over the size limit.
+function tooltip(ev, nowMs, stale, note) {
   if (!ev) return ""
   var when
   if (ev.startMs <= nowMs) {
@@ -126,7 +169,8 @@ function tooltip(ev, nowMs, stale) {
   var lines = [ev.title, when]
   if (responseText(ev.response)) lines.push(responseText(ev.response))
   if (ev.zoomUrl) lines.push("Click to join")
-  if (stale) lines.push("Offline: showing cached calendar")
+  if (note) lines.push(note)
+  else if (stale) lines.push("Offline: showing cached calendar")
   return lines.join("\n")
 }
 
@@ -135,6 +179,8 @@ function errorTooltip(error, message) {
     return "Zoom events: no calendar configured.\nClick to add your Google Calendar secret iCal address."
   if (error === "fetch-failed")
     return "Zoom events: could not download the calendar" + (message ? "\n" + message : "")
+  if (error === "feed-too-large")
+    return "Zoom events: calendar too large" + (message ? "\n" + message : "")
   if (error) return "Zoom events: could not read the calendar (" + error + ")"
   return ""
 }
@@ -149,30 +195,63 @@ function clickCommands(meeting, error, message) {
   if (meeting && meeting.zoomUrl) return [["xdg-open", meeting.zoomUrl]]
   if (error === "no-config") return []
   if (error) return [
-    ["notify-send", "-a", "Zoom events", "Zoom events", errorTooltip(error, message)],
+    notifyCommand("Zoom events", errorTooltip(error, message)),
     ["xdg-open", calendarUrl]
   ]
   return [["xdg-open", calendarUrl]]
 }
 
-// A pasted secret iCal address, trimmed; "" when it is not a usable https URL.
+// Notification daemons render body markup (<a>, <img>, <b>), so the angle
+// brackets are swapped for look-alikes, and "--" keeps a body that starts with
+// a dash from being read as an option.
+function notifyCommand(title, body) {
+  var plain = function(s) { return String(s || "").replace(/</g, "‹").replace(/>/g, "›") }
+  return ["notify-send", "-a", "Zoom events", "--", plain(title), plain(body)]
+}
+
+// A pasted secret iCal address, trimmed; "" when it is not a usable https URL
+// (printable ASCII only, so no whitespace or control characters).
 function normalizeIcsUrl(text) {
   var s = String(text || "").trim()
-  return /^https:\/\/[^\s]+$/i.test(s) ? s : ""
+  return /^https:\/\/[\x21-\x7e]+$/i.test(s) ? s : ""
 }
 
-// Writes the URL to ~/.config/omarchy-zoom-events-google-calendar/ics-url with mode 0600.
-// The URL is passed as an argument, never interpolated into the script.
-function saveCommand(url) {
-  return ["/bin/sh", "-c",
-    'umask 077; d="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-zoom-events-google-calendar"; ' +
-    'mkdir -p "$d" && printf "%s\\n" "$1" > "$d/ics-url.tmp" && mv -f "$d/ics-url.tmp" "$d/ics-url"',
-    "sh", url]
+// Validates the feed and, only if it is good, stores the address and primes the
+// caches from the same download. Prints one JSON line. The URL is an argument,
+// never interpolated into a shell string.
+function connectCommand(script, url) {
+  return [python, "-I", script, "--check", url, "--save"]
 }
 
-// Validates a feed URL without saving it; prints one JSON line.
-function checkCommand(script, url) {
-  return [python, "-I", script, "--check", url]
+// How long the panel waits for a connection before giving up. The script's
+// socket timeout alone does not bound a feed that trickles in.
+var connectTimeoutSeconds = 90
+
+// What to tell the user while a connection runs: { text, hint }.
+function progressText(seconds) {
+  var s = Math.max(0, Math.floor(Number(seconds) || 0))
+  if (s < 4) return { text: "Connecting to Google Calendar…", hint: "" }
+  return {
+    text: "Downloading your calendar… " + s + "s",
+    hint: s < 12 ? "" : "Large calendars can take up to a minute. You can close this panel; "
+      + "the bar shows the progress and you will get a notification when it is done."
+  }
+}
+
+// One-line state for the bar while the panel may be closed.
+// phase: "connecting" | "finishing" | "" ; failed: bool; message: string
+function connectionLabel(phase, failed) {
+  if (phase === "connecting" || phase === "finishing") return icon + "  Connecting…"
+  if (failed) return icon + "  Not connected"
+  return ""
+}
+
+function connectionTooltip(phase, failed, message) {
+  if (phase === "connecting" || phase === "finishing")
+    return "Zoom events: connecting to your calendar…\nYou can keep working; this can take up to a minute."
+  if (failed) return "Zoom events: the calendar could not be connected.\n" + (message || "")
+    + "\nClick to fix the address and try again."
+  return ""
 }
 
 // -> { ok: bool, message: string }. Never throws: a crash or garbage output
@@ -181,12 +260,13 @@ function parseCheck(text, exitCode, stderr) {
   var data
   try { data = JSON.parse(String(text || "").trim()) } catch (e) { data = null }
   if (!data || typeof data !== "object") {
-    var detail = String(stderr || "").trim().split("\n").pop()
+    var detail = clean(String(stderr || "").trim().split("\n").pop(), 200)
     return { ok: false, meetings: 0, message: "The check failed unexpectedly" +
       (exitCode ? " (exit " + exitCode + ")" : "") + (detail ? ": " + detail : ".") }
   }
   if (data.ok === true) return { ok: true, meetings: Number(data.meetings) || 0, message: "" }
-  return { ok: false, meetings: 0, message: String(data.message || "The calendar could not be loaded.") }
+  return { ok: false, meetings: 0,
+    message: clean(data.message, 300) || "The calendar could not be loaded." }
 }
 
 function successText(meetings) {
@@ -199,7 +279,8 @@ function successText(meetings) {
 function disconnectCommand() {
   return ["/bin/sh", "-c",
     'rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-zoom-events-google-calendar/ics-url" ' +
-    '"${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-zoom-events-google-calendar/calendar.ics"']
+    '"${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-zoom-events-google-calendar/calendar.ics" ' +
+    '"${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-zoom-events-google-calendar/events.json"']
 }
 
 // "Today", "Tomorrow", or e.g. "Thu 20 Nov".
@@ -246,6 +327,8 @@ function status(loaded, error, message, stale) {
     detail: "Click the cogwheel to connect your Google Calendar." }
   if (error === "fetch-failed") return { state: "error", text: "Could not reach the calendar",
     detail: (message || "") + " Click the cogwheel to reconnect." }
+  if (error === "feed-too-large") return { state: "error", text: "Calendar too large",
+    detail: (message || "") + (stale ? " Showing the last calendar that loaded." : "") }
   if (error) return { state: "error", text: "Could not read the calendar",
     detail: "Click the cogwheel to check the address (" + error + ")." }
   return { state: "ok", text: "Connected", detail: stale ? "Offline: showing the cached calendar." : "" }
