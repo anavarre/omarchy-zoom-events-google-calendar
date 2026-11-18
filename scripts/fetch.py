@@ -650,12 +650,40 @@ def cached_events(now):
     # Without a current connection the cache is leftover data, never shown.
     if read_url() is None:
         return None
+    # The cache may predate the output budgets. Judge its size before parsing
+    # anything; an oversized or old-format file is dropped and the next
+    # refresh rebuilds it under the current limits.
+    max_file = MAX_OUTPUT_BYTES + 4 * MAX_OUTPUT_EVENTS + 2  # item sizes + separators + brackets
     try:
-        with open(EVENTS_FILE, encoding="utf-8") as f:
-            events = json.load(f)
-        return [e for e in events if dt.datetime.fromisoformat(e["end"]) > now]
-    except (OSError, ValueError, KeyError, TypeError):
+        with open(EVENTS_FILE, "rb") as f:
+            raw = f.read(max_file + 1)
+        if len(raw) > max_file:
+            return None
+        events = json.loads(raw.decode("utf-8"))
+        if not isinstance(events, list) or len(events) > MAX_OUTPUT_EVENTS:
+            return None
+        out = []
+        for e in events:
+            if not valid_cached_event(e):
+                return None
+            if dt.datetime.fromisoformat(e["end"]) > now:
+                out.append(e)
+        return out
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         return None
+
+
+CACHED_FIELDS = ("title", "start", "end", "zoomUrl", "response")
+
+
+def valid_cached_event(e):
+    """Exactly the fields expand() writes, all strings within their limits."""
+    if not isinstance(e, dict) or set(e) != set(CACHED_FIELDS):
+        return False
+    if not all(isinstance(e[k], str) for k in CACHED_FIELDS):
+        return False
+    return (len(e["title"]) <= MAX_TITLE and len(e["zoomUrl"]) <= MAX_LINK
+            and len(e["start"]) <= 64 and len(e["end"]) <= 64 and len(e["response"]) <= 64)
 
 
 def main(argv=None):

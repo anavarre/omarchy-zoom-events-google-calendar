@@ -177,6 +177,31 @@ class CheckTest(unittest.TestCase):
             finally:
                 fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
 
+    def test_cached_events_rejects_oversized_or_old_format_cache(self):
+        import tempfile
+        saved = (fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        now = dt.datetime.now(fetch.UTC)
+        good = {"title": "t", "start": now.isoformat(),
+                "end": (now + dt.timedelta(hours=1)).isoformat(),
+                "zoomUrl": "https://zoom.us/j/1", "response": "accepted"}
+        with tempfile.TemporaryDirectory() as d:
+            self._isolated(d)
+            try:
+                fetch.save_config("https://example.com/basic.ics")
+                for bad in ([dict(good, title="x" * 5000)],
+                            [dict(good, extra="y")],
+                            [good] * (fetch.MAX_OUTPUT_EVENTS + 1),
+                            {"not": "a list"}):
+                    fetch.write_events(bad)
+                    self.assertIsNone(fetch.cached_events(now))
+                with open(fetch.EVENTS_FILE, "w") as f:
+                    f.write("[" + " " * (fetch.MAX_OUTPUT_BYTES * 2) + "]")
+                self.assertIsNone(fetch.cached_events(now))
+                fetch.write_events([good])
+                self.assertEqual(fetch.cached_events(now), [good])
+            finally:
+                fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
     def test_disconnect_reports_deletion_failure(self):
         import tempfile
         saved = (fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
