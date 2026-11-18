@@ -29,6 +29,8 @@ Panel {
   property var hostWidget: null
 
   property string phase: "idle"
+  // A disconnect is waiting for the widget to cancel its refresh and wipe the data.
+  property bool disconnecting: false
   // The last connection attempt failed and has not been fixed yet (the bar mirrors this).
   property bool failed: false
   // Seconds spent in the current attempt.
@@ -49,7 +51,7 @@ Panel {
   readonly property string script: Model.localPath(Qt.resolvedUrl("scripts/fetch.py"))
 
   signal saved()
-  signal disconnected()
+  signal disconnectRequested()
 
   // Named text sizes; every font size in the panel is scaled by the factor.
   property string textSize: "medium"
@@ -110,7 +112,7 @@ Panel {
   Process { id: notifier; running: false; command: [] }
 
   function save() {
-    if (root.busy || checker.running) return
+    if (root.busy || root.disconnecting || checker.running) return
     var url = Model.normalizeIcsUrl(field.text)
     if (url === "") {
       root.errorText = field.text.trim() === ""
@@ -127,7 +129,8 @@ Panel {
     root.failed = false
     root.elapsed = 0
     root.phase = "connecting"
-    checker.command = Model.connectCommand(root.script, url)
+    checker.command = Model.connectCommand(root.script)
+    checker.environment = Model.connectEnvironment(url)
     checker.running = true
   }
 
@@ -185,22 +188,20 @@ Panel {
   }
 
   function disconnect() {
-    if (root.busy) return
+    if (root.busy || root.disconnecting) return
     root.errorText = ""
     root.successText = ""
     root.failed = false
-    disconnector.running = true
+    root.disconnecting = true
+    root.disconnectRequested()
   }
 
-  Process {
-    id: disconnector
-    running: false
-    command: Model.disconnectCommand()
-    onExited: function() {
-      root.showConfig = true
-      root.disconnected()
-      root.focusView()
-    }
+  // Called by the widget once an in-flight refresh is cancelled and the
+  // address and caches are gone.
+  function finishDisconnect() {
+    root.disconnecting = false
+    root.showConfig = true
+    root.focusView()
   }
 
   // Ticks while a connection runs: drives the elapsed counter and enforces the
@@ -242,6 +243,7 @@ Panel {
     stdout: StdioCollector { id: checkOut; waitForEnd: true }
     stderr: StdioCollector { id: checkErr; waitForEnd: true }
     onExited: function(exitCode) {
+      checker.environment = ({})   // the address does not outlive the check
       if (root.phase !== "connecting") return   // timed out or superseded
       var r = Model.parseCheck(checkOut.text, exitCode, checkErr.text)
       if (!r.ok) { root.fail(r.message); return }

@@ -94,7 +94,7 @@ BarWidget {
   Connections {
     target: panelLoader.item
     function onSaved() { root.reload() }
-    function onDisconnected() { root.clearCalendar() }
+    function onDisconnectRequested() { root.beginDisconnect() }
   }
 
   implicitWidth: button.visible ? button.implicitWidth : 0
@@ -106,7 +106,7 @@ BarWidget {
   property bool rerun: false
 
   function refresh() {
-    if (fetcher.running || root.script === "") return
+    if (fetcher.running || root.disconnecting || root.script === "") return
     root.lastFetchMs = Date.now()
     root.cachedRun = false
     fetcher.command = Model.fetchCommand(root.script, root.fetchHours, false)
@@ -116,7 +116,7 @@ BarWidget {
   // The feed download can take tens of seconds, so show the cached meetings
   // first and refresh from the network right after.
   function start() {
-    if (root.script === "") return
+    if (root.script === "" || root.disconnecting) return
     root.cachedRun = true
     fetcher.command = Model.fetchCommand(root.script, root.fetchHours, true)
     fetcher.running = true
@@ -126,13 +126,42 @@ BarWidget {
   // load happens to be running: abandon that load and start over, so the new
   // calendar shows at once instead of at the next timer tick.
   function reload() {
-    if (root.script === "") return
+    if (root.script === "" || root.disconnecting) return
     if (fetcher.running) {
       root.rerun = true
       if (typeof fetcher.signal === "function") fetcher.signal(15)
       return
     }
     root.start()
+  }
+
+  // The user disconnected. An in-flight refresh would write the calendar back
+  // into the cache after it is removed, so cancel it and wait until it has
+  // exited before wiping anything.
+  property bool disconnecting: false
+
+  function beginDisconnect() {
+    root.disconnecting = true
+    root.rerun = false
+    if (!fetcher.running) { root.wipe(); return }
+    if (typeof fetcher.signal === "function") fetcher.signal(15)
+    // Otherwise it ends on its own (socket timeout); fetcher.onExited wipes.
+  }
+
+  function wipe() {
+    wiper.command = Model.disconnectCommand()
+    wiper.running = true
+  }
+
+  Process {
+    id: wiper
+    running: false
+    onExited: function() {
+      root.disconnecting = false
+      root.clearCalendar()
+      if (panelLoader.item && typeof panelLoader.item.finishDisconnect === "function")
+        panelLoader.item.finishDisconnect()
+    }
   }
 
   function clearCalendar() {
@@ -153,6 +182,7 @@ BarWidget {
     stdout: StdioCollector { id: out; waitForEnd: true }
     stderr: StdioCollector { id: err; waitForEnd: true }
     onExited: function(exitCode) {
+      if (root.disconnecting) { root.wipe(); return }
       if (root.rerun) {
         root.rerun = false
         root.cachedRun = false

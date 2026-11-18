@@ -81,6 +81,50 @@ class CheckTest(unittest.TestCase):
             finally:
                 fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
 
+    def test_check_reads_url_from_environment(self):
+        import tempfile
+        saved = (fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        with open(ICS, encoding="utf-8") as f:
+            text = f.read()
+        seen = []
+        with tempfile.TemporaryDirectory() as d:
+            fetch.download = lambda url: seen.append(url) or text
+            fetch.CONFIG_FILE = os.path.join(d, "cfg", "ics-url")
+            fetch.CACHE_FILE = os.path.join(d, "cache", "calendar.ics")
+            fetch.EVENTS_FILE = os.path.join(d, "cache", "events.json")
+            os.environ[fetch.URL_ENV] = "https://example.com/secret.ics"
+            try:
+                out = run_check("-", "--save")
+                self.assertTrue(out["ok"])
+                self.assertEqual(seen, ["https://example.com/secret.ics"])
+                self.assertNotIn(fetch.URL_ENV, os.environ)
+            finally:
+                os.environ.pop(fetch.URL_ENV, None)
+                fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
+    def test_refresh_after_disconnect_does_not_recreate_cache(self):
+        import tempfile
+        saved = (fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        with open(ICS, encoding="utf-8") as f:
+            text = f.read()
+        with tempfile.TemporaryDirectory() as d:
+            fetch.CONFIG_FILE = os.path.join(d, "cfg", "ics-url")
+            fetch.CACHE_FILE = os.path.join(d, "cache", "calendar.ics")
+            fetch.EVENTS_FILE = os.path.join(d, "cache", "events.json")
+            fetch.save_config("https://example.com/basic.ics")
+
+            def download(url):
+                os.unlink(fetch.CONFIG_FILE)  # the user disconnects mid-download
+                return text
+            fetch.download = download
+            try:
+                with redirect_stdout(io.StringIO()):
+                    fetch.main(["--tz", "Europe/Paris"])
+                self.assertFalse(os.path.exists(fetch.CACHE_FILE))
+                self.assertFalse(os.path.exists(fetch.EVENTS_FILE))
+            finally:
+                fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
     def test_failed_check_saves_nothing(self):
         import tempfile
         saved = (fetch.download, fetch.CONFIG_FILE)

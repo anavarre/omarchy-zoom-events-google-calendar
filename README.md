@@ -65,8 +65,9 @@ screen.
 
 ## Dependencies
 
-`/usr/bin/python3` with `python-dateutil` (`pacman -S python-dateutil`), and a
-Nerd Font in the bar (Omarchy's default).
+`/usr/bin/python3` with the `python-dateutil` package already installed (it is
+available in the official Arch repositories; this plugin never installs
+software itself), and a Nerd Font in the bar (Omarchy's default).
 
 ## Tests
 

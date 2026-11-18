@@ -217,10 +217,20 @@ function normalizeIcsUrl(text) {
 }
 
 // Validates the feed and, only if it is good, stores the address and primes the
-// caches from the same download. Prints one JSON line. The URL is an argument,
-// never interpolated into a shell string.
-function connectCommand(script, url) {
-  return [python, "-I", script, "--check", url, "--save"]
+// caches from the same download. Prints one JSON line. The URL is never
+// interpolated into a shell string, and it is not an argument either: process
+// arguments are readable by other local accounts, so it travels in the
+// environment (connectEnvironment), which only the owner can read.
+function connectCommand(script) {
+  return [python, "-I", script, "--check", "-", "--save"]
+}
+
+var urlEnv = "ZOOM_EVENTS_ICS_URL"
+
+function connectEnvironment(url) {
+  var env = {}
+  env[urlEnv] = url
+  return env
 }
 
 // How long the panel waits for a connection before giving up. The script's

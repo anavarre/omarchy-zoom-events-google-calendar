@@ -88,11 +88,14 @@ test("normalizeIcsUrl accepts only https URLs", () => {
   assert.equal(M.normalizeIcsUrl(""), "")
 })
 
-test("connectCommand passes the URL as one argument, never through a shell", () => {
-  const cmd = plain(M.connectCommand("/x/fetch.py", "https://x/$(rm -rf ~)"))
+test("connectCommand keeps the URL out of the arguments and out of a shell", () => {
+  const url = "https://x/$(rm -rf ~)"
+  const cmd = plain(M.connectCommand("/x/fetch.py"))
   assert.equal(cmd[0], "/usr/bin/python3")
   assert.ok(!cmd.includes("/bin/sh"))
-  assert.deepEqual(cmd.slice(-3), ["--check", "https://x/$(rm -rf ~)", "--save"])
+  assert.ok(!cmd.some(a => a.includes("https://")))
+  assert.deepEqual(cmd.slice(-3), ["--check", "-", "--save"])
+  assert.deepEqual(plain(M.connectEnvironment(url)), { ZOOM_EVENTS_ICS_URL: url })
 })
 
 test("disconnectCommand also forgets the events cache", () => {

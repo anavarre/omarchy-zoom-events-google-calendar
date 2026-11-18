@@ -47,6 +47,7 @@ CACHE_FILE = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), APP, "calendar.ics"
 )
 EVENTS_FILE = os.path.join(os.path.dirname(CACHE_FILE), "events.json")
+URL_ENV = "ZOOM_EVENTS_ICS_URL"
 MAX_BYTES = 100 * 1024 * 1024
 TIMEOUT = 45
 # The socket timeout only bounds each read; this bounds a feed that trickles in.
@@ -481,6 +482,12 @@ def write_private(path, write):
         raise
 
 
+def still_configured(url):
+    """True while `url` is still the connected calendar. A refresh that was
+    already running when the user disconnected must not write its download back."""
+    return read_url() == url
+
+
 def save_config(url):
     write_private(CONFIG_FILE, lambda f: f.write(url + "\n"))
 
@@ -560,7 +567,10 @@ def main(argv=None):
     ap.add_argument("--ics", help="read this file instead of the configured feed")
     ap.add_argument("--now", help="pretend it is this ISO 8601 instant")
     ap.add_argument("--hours", type=int, default=24)
-    ap.add_argument("--check", metavar="URL", help="validate this feed URL and exit")
+    ap.add_argument("--check", metavar="URL",
+                    help="validate this feed URL and exit; \"-\" reads it from the "
+                         f"{URL_ENV} environment variable, which keeps the secret "
+                         "address out of the process arguments")
     ap.add_argument("--save", action="store_true",
                     help="with --check: also store the address and prime the caches")
     ap.add_argument("--cached", action="store_true",
@@ -574,6 +584,8 @@ def main(argv=None):
         now = now.replace(tzinfo=local_tz)
 
     if args.check:
+        if args.check == "-":
+            args.check = os.environ.pop(URL_ENV, "")
         return check(args.check, max(1, min(args.hours, 24 * 7)), local_tz, args.save)
 
     if args.cached:
@@ -596,7 +608,8 @@ def main(argv=None):
             return 0
         try:
             text = download(url)
-            write_cache(text)
+            if still_configured(url):
+                write_cache(text)
         except Exception as exc:  # network, HTTP, size: fall back to the cache
             print(f"{APP}: fetch failed: {exc}", file=sys.stderr)
             text = read_cache()
@@ -618,7 +631,7 @@ def main(argv=None):
         print(json.dumps({"events": [], "error": "parse-failed"}))
         return 0
 
-    if not args.ics and not stale:
+    if not args.ics and not stale and still_configured(url):
         write_events(events)
     print(json.dumps({"events": events, "stale": stale, **failure}))
     return 0
