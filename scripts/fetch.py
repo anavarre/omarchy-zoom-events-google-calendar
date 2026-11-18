@@ -60,6 +60,10 @@ UTC = dt.timezone.utc
 EXPAND_SECONDS = 2        # per recurring event
 MAX_SLOW_EVENTS = 5       # after this many hit the limit, stop expanding rules
 MAX_OCCURRENCES = 500     # per recurring event, inside the window
+MAX_TITLE = 200           # characters kept of a title
+MAX_LINK = 2048           # a longer meeting link is not a real one: the event is skipped
+MAX_OUTPUT_BYTES = 1 << 20  # serialized size of all expanded meetings together
+MAX_OUTPUT_EVENTS = 2000    # and their count
 
 # The host must be zoom.us or a subdomain of it: a looser match would accept
 # look-alikes such as evilzoom.us, and the link is opened on click. zoommtg://
@@ -221,7 +225,8 @@ def zoom_link(props):
             if name == key:
                 m = ZOOM_RE.search(unescape(value))
                 if m:
-                    return m.group(0).rstrip(".,;)]")
+                    link = m.group(0).rstrip(".,;)]")
+                    return link if len(link) <= MAX_LINK else None
     return None
 
 
@@ -263,7 +268,7 @@ def normalize_until(rule, dtstart):
 
 # --- expansion --------------------------------------------------------------
 
-def expand(props, owner, overridden, now, window_start, window_end, local_tz, recurring=True):
+def expand(props, owner, overridden, now, window_start, window_end, local_tz, recurring=True, budget=None):
     """The occurrences of one VEVENT that have not ended, as output dicts."""
     dtstart_prop = first(props, "DTSTART")
     if not dtstart_prop:
@@ -287,7 +292,7 @@ def expand(props, owner, overridden, now, window_start, window_end, local_tz, re
         duration = (parse_duration(dur_prop[1]) if dur_prop else None) or dt.timedelta(0)
 
     uid = (first(props, "UID") or ({}, ""))[1]
-    title = unescape((first(props, "SUMMARY") or ({}, ""))[1]).strip() or "Zoom meeting"
+    title = unescape((first(props, "SUMMARY") or ({}, ""))[1]).strip()[:MAX_TITLE] or "Zoom meeting"
     rule_prop = first(props, "RRULE") if not first(props, "RECURRENCE-ID") else None
 
     if rule_prop:
@@ -315,13 +320,22 @@ def expand(props, owner, overridden, now, window_start, window_end, local_tz, re
     for s in starts:
         e = s + duration
         if e > now:
-            out.append({
+            item = {
                 "title": title,
                 "start": s.astimezone(local_tz).isoformat(),
                 "end": e.astimezone(local_tz).isoformat(),
                 "zoomUrl": link,
                 "response": response,
-            })
+            }
+            if budget is not None:
+                # Charged as each occurrence is built, so nothing past the
+                # budget is ever accumulated, cached or printed.
+                budget["events"] -= 1
+                budget["bytes"] -= len(json.dumps(item))
+                if budget["events"] < 0 or budget["bytes"] < 0:
+                    budget["spent"] = True
+                    break
+            out.append(item)
     return out
 
 
@@ -359,10 +373,14 @@ def occurrences(text, now, hours, local_tz, owner_hint=""):
             continue
 
     out, slow = [], 0
+    budget = {"events": MAX_OUTPUT_EVENTS, "bytes": MAX_OUTPUT_BYTES}
     for props in masters + overrides:
         try:
             out.extend(expand(props, owner, overridden, now, window_start, window_end,
-                              local_tz, slow < MAX_SLOW_EVENTS))
+                              local_tz, slow < MAX_SLOW_EVENTS, budget))
+            if budget.get("spent"):
+                print(f"{APP}: output budget reached; remaining meetings dropped", file=sys.stderr)
+                break
         except LimitReached:
             slow += 1
             print(f"{APP}: skipped an event whose recurrence took too long", file=sys.stderr)

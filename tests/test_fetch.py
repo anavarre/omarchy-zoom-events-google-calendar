@@ -285,6 +285,32 @@ class SecurityTest(unittest.TestCase):
                               extra="RRULE:FREQ=HOURLY;BYMINUTE=0,10,20,30,40,50\nLOCATION:https://zoom.us/j/1")
         self.assertLessEqual(len(expand(feed(hourly), hours=168)), fetch.MAX_OCCURRENCES)
 
+    def test_title_and_link_lengths_are_limited(self):
+        big = EVENT.format(uid="t", start="20261117T130000Z", end="20261117T133000Z",
+                           title="x" * 50000, extra="LOCATION:https://zoom.us/j/1")
+        long_link = EVENT.format(uid="l", start="20261117T130000Z", end="20261117T133000Z", title="Long",
+                                 extra="LOCATION:https://zoom.us/j/" + "9" * 5000)
+        out = expand(feed(big, long_link))
+        self.assertEqual([len(e["title"]) for e in out], [fetch.MAX_TITLE])
+
+    def test_total_output_is_budgeted(self):
+        hourly = EVENT.format(uid="h", start="20261101T000000Z", end="20261101T000100Z", title="y" * 150,
+                              extra="RRULE:FREQ=HOURLY;BYMINUTE=0,10,20,30,40,50\nLOCATION:https://zoom.us/j/1")
+        events = [hourly.replace("UID:h", "UID:h%d" % i) for i in range(40)]
+        saved = (fetch.MAX_OUTPUT_BYTES, fetch.MAX_OUTPUT_EVENTS)
+        fetch.MAX_OUTPUT_BYTES, fetch.MAX_OUTPUT_EVENTS = 20000, 10**6
+        try:
+            out = expand(feed(*events), hours=168)
+        finally:
+            fetch.MAX_OUTPUT_BYTES, fetch.MAX_OUTPUT_EVENTS = saved
+        self.assertTrue(out)
+        self.assertLessEqual(len(json.dumps(out)), 20000 + 2 * len(out))
+        fetch.MAX_OUTPUT_EVENTS = 7
+        try:
+            self.assertEqual(len(expand(feed(*events), hours=168)), 7)
+        finally:
+            fetch.MAX_OUTPUT_EVENTS = saved[1]
+
     def test_malformed_event_does_not_hide_the_rest(self):
         ok = EVENT.format(uid="ok", start="20261117T130000Z", end="20261117T133000Z",
                           title="Fine", extra="LOCATION:https://zoom.us/j/1")
