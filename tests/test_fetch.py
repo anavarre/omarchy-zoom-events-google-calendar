@@ -126,6 +126,30 @@ class CheckTest(unittest.TestCase):
             finally:
                 fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
 
+    def test_connect_started_before_disconnect_is_rejected(self):
+        import tempfile
+        saved = (fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE)
+        with open(ICS, encoding="utf-8") as f:
+            text = f.read()
+        with tempfile.TemporaryDirectory() as d:
+            fetch.CONFIG_FILE = os.path.join(d, "cfg", "ics-url")
+            fetch.CACHE_FILE = os.path.join(d, "cache", "calendar.ics")
+            fetch.EVENTS_FILE = os.path.join(d, "cache", "events.json")
+
+            def download(url):
+                with redirect_stdout(io.StringIO()):
+                    fetch.disconnect()  # another screen disconnects mid-connect
+                return text
+            fetch.download = download
+            try:
+                out = run_check("https://example.com/basic.ics", "--save")
+                self.assertFalse(out["ok"])
+                self.assertFalse(os.path.exists(fetch.CONFIG_FILE))
+                self.assertFalse(os.path.exists(fetch.CACHE_FILE))
+                self.assertFalse(os.path.exists(fetch.EVENTS_FILE))
+            finally:
+                fetch.download, fetch.CONFIG_FILE, fetch.CACHE_FILE, fetch.EVENTS_FILE = saved
+
     def _isolated(self, d):
         fetch.CONFIG_FILE = os.path.join(d, "cfg", "ics-url")
         fetch.CACHE_FILE = os.path.join(d, "cache", "calendar.ics")

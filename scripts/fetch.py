@@ -499,10 +499,33 @@ def state_lock():
         os.close(fd)  # closing releases the lock
 
 
-def still_configured(url):
-    """True while `url` is still the connected calendar. A refresh that was
-    already running when the user disconnected must not write its download back."""
-    return read_url() == url
+GENERATION_FILE = None  # default: next to the cache; tests may override
+
+
+def _generation_path():
+    return GENERATION_FILE or os.path.join(os.path.dirname(CACHE_FILE), ".generation")
+
+
+def read_generation():
+    """Marker shared by every process (one widget instance runs per screen).
+    Disconnect replaces it, so work that captured the marker before a
+    disconnect can tell, under the lock, that its result is out of date."""
+    try:
+        with open(_generation_path(), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def bump_generation():
+    token = os.urandom(8).hex()
+    write_private(_generation_path(), lambda f: f.write(token + "\n"))
+
+
+def still_configured(url, generation):
+    """True while `url` is still the connected calendar and no disconnect has
+    happened since `generation` was captured. Call under the state lock."""
+    return read_generation() == generation and read_url() == url
 
 
 def save_config(url):
@@ -519,6 +542,7 @@ def check(url, hours, local_tz, save=False):
     if not valid_url(url):
         print(json.dumps({"ok": False, "message": "That is not a valid address."}))
         return 0
+    generation = read_generation()  # before any work: a later disconnect voids this one
     try:
         text = download(url)
     except Exception as exc:
@@ -536,6 +560,11 @@ def check(url, hours, local_tz, save=False):
     if save:
         try:
             with state_lock():
+                if read_generation() != generation:
+                    print(json.dumps({"ok": False, "message":
+                                      "The calendar was disconnected while it was being "
+                                      "connected. Connect it again if you still want it."}))
+                    return 0
                 write_cache(text)
                 write_events(events)
                 save_config(url)  # last: a half-written state never looks configured
@@ -578,6 +607,10 @@ def disconnect():
     failures = []
     try:
         with state_lock():
+            try:
+                bump_generation()  # first: voids every refresh/connect already in flight
+            except OSError as exc:
+                failures.append(f"generation: {exc.strerror or exc}")
             for path in (CONFIG_FILE, CACHE_FILE, EVENTS_FILE):
                 try:
                     os.unlink(path)
@@ -652,6 +685,7 @@ def main(argv=None):
         with open(args.ics, encoding="utf-8") as f:
             text = f.read()
     else:
+        generation = read_generation()
         url = read_url()
         if not url:
             print(json.dumps({"events": [], "error": "no-config"}))
@@ -659,7 +693,7 @@ def main(argv=None):
         try:
             text = download(url)
             with state_lock():
-                if still_configured(url):
+                if still_configured(url, generation):
                     write_cache(text)
         except Exception as exc:  # network, HTTP, size: fall back to the cache
             print(f"{APP}: fetch failed: {exc}", file=sys.stderr)
@@ -684,7 +718,7 @@ def main(argv=None):
 
     if not args.ics and not stale:
         with state_lock():
-            if still_configured(url):
+            if still_configured(url, generation):
                 write_events(events)
     print(json.dumps({"events": events, "stale": stale, **failure}))
     return 0
