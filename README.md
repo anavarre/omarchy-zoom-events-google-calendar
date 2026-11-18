@@ -1,5 +1,7 @@
 # Zoom Events for Google Calendar
 
+![Preview](preview.png)
+
 An Omarchy bar widget that shows your current or next Zoom meeting as
 ` <when> <meeting title>` (`Now`, `18mn`, `1h34mn`, or `2d`), read from your Google Calendar. Left click always opens the panel (paste your calendar's secret iCal address,
 see errors, jump to Google Calendar settings); right click refreshes. The widget hides itself when nothing is
