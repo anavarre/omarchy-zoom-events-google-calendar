@@ -720,6 +720,85 @@ Panel {
           }
         }
       }
+
+      // ---------- Alerts ----------
+      Item { width: 1; height: Style.space(16); visible: root.showConfig }
+
+      Column {
+        width: parent.width
+        visible: root.showConfig
+        spacing: Style.space(8)
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          text: "Alerts"
+          color: root.accent
+          font.family: root.fontFamily
+          font.pixelSize: root.headerSize
+          font.bold: true
+        }
+
+        Item {
+          width: parent.width
+          height: Math.max(alertEnabledCaption.implicitHeight, alertEnabledSwitch.implicitHeight)
+          opacity: alertEnabledSwitch.enabled ? 1 : 0.5
+
+          Text {
+            textFormat: Text.PlainText
+            id: alertEnabledCaption
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - alertEnabledSwitch.width - Style.space(8)
+            text: "Warn 5 minutes before a meeting"
+            elide: Text.ElideRight
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.body)
+          }
+
+          ToggleSwitch {
+            id: alertEnabledSwitch
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            enabled: root.host !== null && true
+            checked: root.host ? root.host.alertEnabled : true
+            foreground: root.foreground
+            accent: root.accent
+            onToggled: if (root.host) root.host.setAlertEnabled(!checked)
+          }
+        }
+
+        Item {
+          width: parent.width
+          height: Math.max(flashEnabledCaption.implicitHeight, flashEnabledSwitch.implicitHeight)
+          opacity: flashEnabledSwitch.enabled ? 1 : 0.5
+
+          Text {
+            textFormat: Text.PlainText
+            id: flashEnabledCaption
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width - flashEnabledSwitch.width - Style.space(8)
+            text: "Flash in the last minute"
+            elide: Text.ElideRight
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: root.fs(Style.font.body)
+          }
+
+          ToggleSwitch {
+            id: flashEnabledSwitch
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            enabled: root.host !== null && root.host.alertEnabled
+            checked: root.host ? root.host.flashEnabled : true
+            foreground: root.foreground
+            accent: root.accent
+            onToggled: if (root.host) root.host.setFlashEnabled(!checked)
+          }
+        }
+      }
     }
 
     // The cogwheel sits top right, vertically centred on the first visible header

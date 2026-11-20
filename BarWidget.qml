@@ -17,8 +17,22 @@ BarWidget {
   readonly property int maxTitleLength: Model.clampInt(root.setting("maxTitleLength", 40), 5, 120, 40)
 
   // Minutes before a meeting starts during which the bar takes the theme's
-  // urgent colour. 0 turns the alert off.
-  readonly property int alertMinutes: Model.clampInt(root.setting("alertMinutes", 5), 0, 60, 5)
+  // urgent colour. 0, or alertEnabled off, turns the alert off.
+  readonly property int alertMinutes: root.alertEnabled
+    ? Model.clampInt(root.setting("alertMinutes", 5), 0, 60, 5) : 0
+
+  // Both toggles are switched from the panel's Alerts section. The local value
+  // shows the change at once; it is dropped when shell.json reloads with it.
+  property var alertEnabledLocal: undefined
+  property var flashEnabledLocal: undefined
+  readonly property bool alertEnabled: root.alertEnabledLocal !== undefined
+    ? root.alertEnabledLocal : Model.flag(root.setting("alertEnabled", true), true)
+  readonly property bool flashEnabled: root.flashEnabledLocal !== undefined
+    ? root.flashEnabledLocal : Model.flag(root.setting("flashEnabled", true), true)
+  onSettingsChanged: { root.alertEnabledLocal = undefined; root.flashEnabledLocal = undefined }
+
+  function setAlertEnabled(on) { root.alertEnabledLocal = on; root.saveSetting("alertEnabled", on) }
+  function setFlashEnabled(on) { root.flashEnabledLocal = on; root.saveSetting("flashEnabled", on) }
 
   readonly property int maxMeetings: Model.clampInt(root.setting("maxMeetings", 5), 1, 10, 5)
   // The panel lists several days ahead; the bar label still honours lookaheadHours.
@@ -240,8 +254,9 @@ BarWidget {
 
   Process { id: notifier; running: false }
 
-  // The last minute before the start: the widget pulses. Off when alerts are.
-  readonly property bool pulsing: root.alertMinutes > 0
+  // The last minute before the start: the widget pulses. Off when alerts or
+  // flashing are.
+  readonly property bool pulsing: root.alertMinutes > 0 && root.flashEnabled
     && Model.imminent(root.meeting, root.nowMs, 1)
 
   // nowMs only ticks every 30s, so tick each second while a start is close

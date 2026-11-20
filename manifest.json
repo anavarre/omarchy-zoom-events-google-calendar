@@ -15,11 +15,13 @@
     "aliases": ["zoom", "meeting", "calendar", "google"],
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": { "refreshMinutes": 10, "lookaheadHours": 12, "maxTitleLength": 40, "maxMeetings": 5, "textSize": "medium" },
+    "defaults": { "refreshMinutes": 10, "lookaheadHours": 12, "maxTitleLength": 40, "maxMeetings": 5, "alertEnabled": true, "flashEnabled": true, "textSize": "medium" },
     "schema": [
       { "key": "refreshMinutes", "type": "integer", "label": "Refresh interval (minutes)", "min": 1, "max": 120, "step": 1, "defaultValue": 10, "description": "How often the calendar feed is downloaded." },
       { "key": "lookaheadHours", "type": "integer", "label": "Look ahead (hours)", "min": 1, "max": 168, "step": 1, "defaultValue": 12, "description": "Only show meetings starting within this many hours." },
       { "key": "maxTitleLength", "type": "integer", "label": "Max title length", "min": 5, "max": 120, "step": 1, "defaultValue": 40, "description": "Longer titles are truncated." },
+      { "key": "alertEnabled", "type": "boolean", "label": "Warn before meetings", "defaultValue": true, "description": "The bar takes the theme's urgent colour in the 5 minutes before a meeting starts." },
+      { "key": "flashEnabled", "type": "boolean", "label": "Flash in the last minute", "defaultValue": true, "description": "The widget pulses in the last minute before a meeting starts. Needs the warning on." },
       { "key": "maxMeetings", "type": "integer", "label": "Meetings in the panel", "min": 1, "max": 10, "step": 1, "defaultValue": 5, "description": "How many upcoming meetings the panel lists, across as many days as needed." },
       { "key": "textSize", "type": "enum", "label": "Text size", "options": ["small", "medium", "large", "xlarge"], "defaultValue": "medium", "description": "How large the panel's text reads: small, medium, large or xlarge (extra large)." }
     ]

@@ -26,6 +26,14 @@ function clampInt(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n))
 }
 
+// A boolean setting: true/false or "true"/"false" (as hand-edited shell.json
+// might hold); anything else falls back.
+function flag(value, fallback) {
+  if (value === true || value === "true") return true
+  if (value === false || value === "false") return false
+  return fallback
+}
+
 // Text that arrives from the calendar (titles are written by whoever sent the
 // invite) or from an error: one line, no control characters, no bidi overrides
 // that could reorder what is shown, and a bounded length.

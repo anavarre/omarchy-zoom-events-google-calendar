@@ -67,6 +67,8 @@ events that have a Zoom link.
 | `lookaheadHours` | 12 | only show meetings starting within this window |
 | `maxTitleLength` | 40 | titles longer than this are truncated |
 | `alertMinutes` | 5 | the bar takes the theme's urgent colour this many minutes before a meeting starts (0 turns it off); in the last minute the widget also pulses until the meeting starts |
+| `alertEnabled` | true | turns the urgent-colour warning before a meeting on or off (also a switch in the panel's settings) |
+| `flashEnabled` | true | turns the last-minute pulse on or off; it needs `alertEnabled` (also a switch in the panel's settings) |
 | `maxMeetings` | 5 | meetings listed in the panel (1-10), across as many days as needed |
 
 If the download fails, the last good copy in

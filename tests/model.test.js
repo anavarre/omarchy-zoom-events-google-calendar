@@ -279,3 +279,10 @@ test("notifications carry no markup and cannot be read as options", () => {
   assert.equal(M.normalizeIcsUrl(" https://x.example/a.ics "), "https://x.example/a.ics")
   assert.equal(M.normalizeIcsUrl("https://x.example/a\u0001.ics"), "")
 })
+
+test("flag reads booleans and their string forms", () => {
+  assert.equal(M.flag(true, false), true)
+  assert.equal(M.flag("false", true), false)
+  assert.equal(M.flag(undefined, true), true)
+  assert.equal(M.flag(0, true), true)
+})
